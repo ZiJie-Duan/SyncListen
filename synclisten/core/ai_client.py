@@ -38,19 +38,24 @@ class AIClient:
 
         return response.choices[0].message.content
 
-    def process_document(self, document_text, instruction):
-        """对文档内容执行 AI 指令，直接返回处理结果。"""
+    def process_document(self, document_text, instruction, terminology=None):
+        """对文档内容执行 AI 指令，直接返回处理结果。
+
+        Args:
+            document_text: 当前文档内容
+            instruction: 用户的处理指令
+            terminology: 可选，专业名词列表，用于纠正语音转写错误
+        """
         if document_text:
             system_prompt = (
                 "你正在根据用户的要求处理用户的文字信息"
                 "用户会给你一段文本信息和一个处理要求。"
                 "请严格按照用户的要求处理文本，只输出处理后的结果，不要添加解释。"
-                "请确保输出内容是完整的，不允许缩写，不允许简化任何细节" 
+                "请确保输出内容是完整的，不允许缩写，不允许简化任何细节"
             )
             user_prompt = (
                 f"【文本信息】\n{document_text}\n\n"
                 f"【处理要求】\n{instruction}\n\n"
-                f" 处理后的结果："
             )
         else:
             # 没有现有内容时，直接根据指令生成
@@ -62,6 +67,17 @@ class AIClient:
                 f"请直接输出结果："
             )
 
+        if terminology:
+            system_prompt += (
+                f"\n以下专业名词在语音转写中可能被错误识别，"
+                f"请确保在处理后的文本中正确使用这些词汇：{terminology}\n"
+            )
+            user_prompt += (
+                f"\n【专业名词参考】\n{terminology}\n"
+                f"请确保上述专业名词被正确使用。"
+            )
+
+        user_prompt += "\n处理后的结果："
         return self.chat(system_prompt, user_prompt)
 
     def incremental_notes(self, existing_content, new_input):
@@ -95,11 +111,12 @@ class AIClient:
 
         return self.chat(system_prompt, user_prompt, temperature=0.3)
 
-    def polish_text(self, raw_text):
+    def polish_text(self, raw_text, terminology=None):
         """润色转写内容：去语病、去重复、口语转书面、保留细节。
 
         Args:
             raw_text: 语音转写的原始文字
+            terminology: 可选，专业名词列表，用于纠正语音转写错误
 
         Returns:
             润色后的书面文字
@@ -113,8 +130,13 @@ class AIClient:
             "4. 强化重点，让表达更精炼、有逻辑\n"
             "5. 适当分段和格式化（列表、标题等）\n"
             "6. 保留所有细节和信息，不要省略任何实质性内容\n"
-            "只输出润色后的结果，不要加解释。"
         )
+        if terminology:
+            system_prompt += (
+                f"\n以下专业名词在语音转写中可能被错误识别，"
+                f"请确保在润色后的文本中正确使用这些词汇：{terminology}\n"
+            )
+        system_prompt += "只输出润色后的结果，不要加解释。"
 
         user_prompt = f"请润色以下内容：\n\n{raw_text}"
         return self.chat(system_prompt, user_prompt, temperature=0.3)

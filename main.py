@@ -11,6 +11,8 @@ SyncListen — 极简语音工作流
 [X]    重做      — 前进到下一版本
 [C]    复制      — 手动复制到剪贴板
 [Q]    退出
+
+录音结束后可输入专业名词（空格分隔），AI会用其纠正转写错误
 """
 
 import os
@@ -145,8 +147,13 @@ def _fmt_content(text, width, max_lines=15):
     return lines
 
 
-def redraw(session, transient="", hint=""):
-    """清屏并重绘分区：内容区 + 临时区 + 操作栏。"""
+def redraw(session, transient="", hint="", input_buffer=None):
+    """清屏并重绘分区：内容区 + 临时区 + 输入区 + 操作栏。
+
+    Args:
+        input_buffer: 如果为字符串（包括空串），则显示输入区，
+                      None 则不显示输入区。
+    """
     _clear()
     w = _term_width()
 
@@ -156,13 +163,22 @@ def redraw(session, transient="", hint=""):
         print(line)
     print("─" * w)
 
-    # 下半区：临时转写 / 状态提示
+    # 中间区：临时转写 / 状态提示
     if transient:
         wrapped = _wrap_text(transient, w - 3)  # 预留 🎙 前缀
         for i, line in enumerate(wrapped):
             prefix = "🎙 " if i == 0 else "   "
             print(f"{prefix}{line}")
         print("─" * w)
+
+    # 输入区：用于收集专业名词
+    if input_buffer is not None:
+        prompt = "✏️ 专业名词："
+        avail = w - len(prompt) - 1
+        visible = input_buffer[-avail:] if len(input_buffer) > avail else input_buffer
+        print(f"{prompt}{visible}▌")
+        print("─" * w)
+        hint = "↵ 确认 | ⌫ 删除 | ESC 跳过"
 
     # 底部操作栏
     print("[↵]✍️  [A]🤖  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
@@ -212,8 +228,97 @@ def copy_to_clipboard(text):
             )
 
 
+def _read_input_line(session, transient=""):
+    """在 TTY 下实时读取一行用户输入（不回显到终端，由 redraw 渲染）。
+
+    返回用户输入的字符串；按 ESC 取消返回空串。
+    """
+    buf = ""
+    redraw(session, transient=transient, input_buffer=buf)
+
+    while True:
+        try:
+            ch = _getch_raw()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+        # 回车确认
+        if ch in ("\r", "\n"):
+            return buf
+
+        # ESC 取消（并吃掉可能的转义序列余下字符）
+        if ch == "\x1b":
+            while True:
+                try:
+                    nxt = _getch_raw()
+                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
+                        break
+                except (EOFError, KeyboardInterrupt):
+                    break
+            return ""
+
+        # 退格 / DEL
+        if ch in ("\x7f", "\b"):
+            buf = buf[:-1]
+            redraw(session, transient=transient, input_buffer=buf)
+            continue
+
+        # 可打印字符（排除控制字符）
+        if ord(ch) >= 32:
+            buf += ch
+            redraw(session, transient=transient, input_buffer=buf)
+
+
+def _apply_terminology(text, terminology):
+    """无 AI 时，用用户输入的术语对转写文本做简单替换。
+
+    支持两种格式（空格分隔）：
+      - 直接给出正确词，程序在文本中找最相似的词替换
+      - 错词->对词，直接做字符串替换
+    """
+    if not terminology or not text:
+        return text
+
+    terms = [t.strip() for t in terminology.split() if t.strip()]
+    if not terms:
+        return text
+
+    result = text
+
+    for term in terms:
+        if "->" in term:
+            # 显式替换规则
+            wrong, correct = term.split("->", 1)
+            wrong = wrong.strip()
+            correct = correct.strip()
+            if wrong:
+                result = result.replace(wrong, correct)
+        else:
+            # 模糊替换：在文本中找长度相近、字符重叠度高的词
+            words = list(set(result.split()))  # 去重，避免重复替换
+            best_match = None
+            best_score = 0
+            for word in words:
+                if len(word) < 2:
+                    continue
+                len_diff = abs(len(word) - len(term))
+                if len_diff > 2:
+                    continue
+                # 简单相似度：共同字符比例
+                common = len(set(word.lower()) & set(term.lower()))
+                score = common / max(len(word), len(term))
+                if score > best_score and score >= 0.5:
+                    best_score = score
+                    best_match = word
+
+            if best_match:
+                result = result.replace(best_match, term)
+
+    return result
+
+
 def cmd_write(session, recorder, transcriber, ai_client):
-    """写入模式：录音 → 转写 → AI 润色 → 追加，压入历史。"""
+    """写入模式：录音 → 转写 → 输入专业名词 → AI 润色 → 追加，压入历史。"""
     redraw(session, hint="🔴 录音中… 按回车停止")
     recorder.start()
     _wait_for_enter()
@@ -229,14 +334,19 @@ def cmd_write(session, recorder, transcriber, ai_client):
         redraw(session, hint="⚠️ 未识别到文字")
         return
 
+    # 专业名词输入阶段
+    terminology = _read_input_line(session, transient=raw_text)
+
+    # AI 润色（带上专业名词）
     if ai_client is not None:
         redraw(session, transient=raw_text, hint="⏳ 润色中…")
         try:
-            text = ai_client.polish_text(raw_text)
+            text = ai_client.polish_text(raw_text, terminology=terminology or None)
         except Exception:
             text = raw_text
     else:
-        text = raw_text
+        # 无 AI 时做简单替换
+        text = _apply_terminology(raw_text, terminology) if terminology else raw_text
 
     new_content = session.content
     if new_content and not new_content.endswith("\n"):
@@ -248,7 +358,7 @@ def cmd_write(session, recorder, transcriber, ai_client):
 
 
 def cmd_ai(session, recorder, transcriber, ai_client):
-    """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史。"""
+    """AI 指令模式：录音为指令 → 输入专业名词 → AI 处理 → 覆盖内容，压入历史。"""
     redraw(session, hint="🔴 说出指令… 按回车停止")
     recorder.start()
     _wait_for_enter()
@@ -264,9 +374,14 @@ def cmd_ai(session, recorder, transcriber, ai_client):
         redraw(session, hint="⚠️ 未识别到文字")
         return
 
+    # 专业名词输入阶段
+    terminology = _read_input_line(session, transient=f"📋 {instruction}")
+
     redraw(session, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
     try:
-        result = ai_client.process_document(session.content, instruction)
+        result = ai_client.process_document(
+            session.content, instruction, terminology=terminology or None
+        )
         session.commit(result)
         copy_to_clipboard(session.content)
         redraw(session, hint="✅ AI 已覆盖")
