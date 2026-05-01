@@ -4,9 +4,11 @@
 import os
 
 # 加载 .env 文件（如果存在）
+# 始终从项目根目录加载，而不是当前工作目录
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    load_dotenv(os.path.join(_project_dir, ".env"))
 except ImportError:
     pass
 

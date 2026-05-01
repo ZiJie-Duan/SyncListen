@@ -24,6 +24,56 @@ from synclisten.core.recorder import AudioRecorder
 from synclisten.core.transcriber import SenseVoiceTranscriber
 from synclisten.core.ai_client import AIClient
 
+# ── 跨平台即时按键读取 ──────────────────────────────────
+def _is_tty():
+    return sys.stdin.isatty()
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _getch_raw():
+        return msvcrt.getch().decode("utf-8", errors="ignore")
+else:
+    import tty
+    import termios
+
+    def _getch_raw():
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return ch
+
+
+def _getch():
+    """读取单个字符。在 TTY 下即时响应，非 TTY 下退化为 input()。"""
+    if _is_tty():
+        return _getch_raw()
+    # 非交互环境：退化为标准 input()
+    try:
+        line = input()
+        return line[0] if line else "\n"
+    except EOFError:
+        return ""
+
+
+def _wait_for_enter():
+    """阻塞直到检测到回车/换行。"""
+    if not _is_tty():
+        try:
+            input()
+        except EOFError:
+            pass
+        return
+    while True:
+        ch = _getch_raw()
+        if ch in ("\r", "\n"):
+            break
+
 
 class Session:
     """单会话状态（内存中，退出即消失）"""
@@ -166,10 +216,7 @@ def cmd_write(session, recorder, transcriber, ai_client):
     """写入模式：录音 → 转写 → AI 润色 → 追加，压入历史。"""
     redraw(session, hint="🔴 录音中… 按回车停止")
     recorder.start()
-    try:
-        input()
-    except EOFError:
-        pass
+    _wait_for_enter()
 
     redraw(session, hint="⏳ 转写中…")
     audio = recorder.stop()
@@ -204,10 +251,7 @@ def cmd_ai(session, recorder, transcriber, ai_client):
     """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史。"""
     redraw(session, hint="🔴 说出指令… 按回车停止")
     recorder.start()
-    try:
-        input()
-    except EOFError:
-        pass
+    _wait_for_enter()
 
     redraw(session, hint="⏳ 转写中…")
     audio = recorder.stop()
@@ -222,11 +266,16 @@ def cmd_ai(session, recorder, transcriber, ai_client):
 
     redraw(session, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
     try:
+        # DEBUG: 打印关键变量到 stderr，便于追踪问题
+        print(f"[DEBUG] session.content={session.content!r}", file=sys.stderr)
+        print(f"[DEBUG] instruction={instruction!r}", file=sys.stderr)
         result = ai_client.process_document(session.content, instruction)
+        print(f"[DEBUG] result={result!r}", file=sys.stderr)
         session.commit(result)
         copy_to_clipboard(session.content)
         redraw(session, hint="✅ AI 已覆盖")
     except Exception as e:
+        print(f"[DEBUG] ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         redraw(session, hint=f"❌ {e}")
 
 
@@ -278,31 +327,45 @@ def main():
 
     while True:
         try:
-            choice = input().strip().lower()
+            ch = _getch()
         except (EOFError, KeyboardInterrupt):
             _clear()
             break
 
-        if choice == "":
+        # 忽略非预期的控制字符（如 Esc 序列开头）
+        if ch == "\x1b":
+            # 吃掉可能的 Esc 序列剩余字符
+            while True:
+                try:
+                    nxt = _getch()
+                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
+                        break
+                except (EOFError, KeyboardInterrupt):
+                    break
+            continue
+
+        choice = ch.lower()
+
+        if choice == "\r" or choice == "\n":
             cmd_write(session, recorder, transcriber, ai_client)
-        elif choice in ("a",):
+        elif choice == "a":
             if ai_client is None:
                 redraw(session, hint="⚠️ AI 未配置")
             else:
                 cmd_ai(session, recorder, transcriber, ai_client)
-        elif choice in ("z",):
+        elif choice == "z":
             cmd_undo(session)
-        elif choice in ("x",):
+        elif choice == "x":
             cmd_redo(session)
-        elif choice in ("d",):
+        elif choice == "d":
             cmd_clear(session)
-        elif choice in ("c",):
+        elif choice == "c":
             cmd_copy(session)
-        elif choice in ("q",):
+        elif choice == "q":
             _clear()
             break
         else:
-            redraw(session, hint="?")
+            redraw(session, hint=f"? 未知按键: {repr(ch)}")
 
 
 if __name__ == "__main__":

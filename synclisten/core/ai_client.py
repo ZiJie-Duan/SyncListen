@@ -40,17 +40,27 @@ class AIClient:
 
     def process_document(self, document_text, instruction):
         """对文档内容执行 AI 指令，直接返回处理结果。"""
-        system_prompt = (
-            "你是一位专业的文字处理助手。"
-            "用户会给你一段文字和一个处理要求。"
-            "请严格按照用户的要求处理文字，只输出处理后的结果，不要添加解释。"
-        )
-
-        user_prompt = (
-            f"【待处理的文字】\n{document_text}\n\n"
-            f"【处理要求】\n{instruction}\n\n"
-            f"请直接输出处理后的结果："
-        )
+        if document_text:
+            system_prompt = (
+                "你是一位专业的文字处理助手。"
+                "用户会给你一段文字和一个处理要求。"
+                "请严格按照用户的要求处理文字，只输出处理后的结果，不要添加解释。"
+            )
+            user_prompt = (
+                f"【待处理的文字】\n{document_text}\n\n"
+                f"【处理要求】\n{instruction}\n\n"
+                f"请直接输出处理后的结果："
+            )
+        else:
+            # 没有现有内容时，直接根据指令生成
+            system_prompt = (
+                "你是一位专业的文字处理助手。"
+                "请根据用户的要求直接生成内容，只输出结果，不要添加解释。"
+            )
+            user_prompt = (
+                f"【要求】\n{instruction}\n\n"
+                f"请直接输出结果："
+            )
 
         return self.chat(system_prompt, user_prompt)
 
