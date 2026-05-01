@@ -266,16 +266,11 @@ def cmd_ai(session, recorder, transcriber, ai_client):
 
     redraw(session, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
     try:
-        # DEBUG: 打印关键变量到 stderr，便于追踪问题
-        print(f"[DEBUG] session.content={session.content!r}", file=sys.stderr)
-        print(f"[DEBUG] instruction={instruction!r}", file=sys.stderr)
         result = ai_client.process_document(session.content, instruction)
-        print(f"[DEBUG] result={result!r}", file=sys.stderr)
         session.commit(result)
         copy_to_clipboard(session.content)
         redraw(session, hint="✅ AI 已覆盖")
     except Exception as e:
-        print(f"[DEBUG] ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         redraw(session, hint=f"❌ {e}")
 
 
