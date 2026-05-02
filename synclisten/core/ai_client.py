@@ -69,12 +69,15 @@ class AIClient:
 
         if terminology:
             system_prompt += (
-                f"\n以下专业名词在语音转写中可能被错误识别，"
-                f"请确保在处理后的文本中正确使用这些词汇：{terminology}\n"
+                f"\n下列是用户提供的易错词参考表，文本中可能存在因语音转写"
+                f"造成的同音/近音/形近错词。请在执行用户指令前，先扫描全文，"
+                f"将文本中可疑的错词替换为参考表中正确的词汇；拿不准的词不要改，"
+                f"避免引入新错误。最终在处理后的文本中也确保这些词汇被正确使用："
+                f"{terminology}\n"
             )
             user_prompt += (
                 f"\n【专业名词参考】\n{terminology}\n"
-                f"请确保上述专业名词被正确使用。"
+                f"请先按参考表修复文本中的转写错词，再执行处理要求。"
             )
 
         user_prompt += "\n处理后的结果："
@@ -111,12 +114,11 @@ class AIClient:
 
         return self.chat(system_prompt, user_prompt, temperature=0.3)
 
-    def polish_text(self, raw_text, terminology=None):
+    def polish_text(self, raw_text):
         """润色转写内容：去语病、去重复、口语转书面、保留细节。
 
         Args:
             raw_text: 语音转写的原始文字
-            terminology: 可选，专业名词列表，用于纠正语音转写错误
 
         Returns:
             润色后的书面文字
@@ -130,13 +132,37 @@ class AIClient:
             "4. 强化重点，让表达更精炼、有逻辑\n"
             "5. 适当分段和格式化（列表、标题等）\n"
             "6. 保留所有细节和信息，不要省略任何实质性内容\n"
+            "只输出润色后的结果，不要加解释。"
         )
-        if terminology:
-            system_prompt += (
-                f"\n以下专业名词在语音转写中可能被错误识别，"
-                f"请确保在润色后的文本中正确使用这些词汇：{terminology}\n"
-            )
-        system_prompt += "只输出润色后的结果，不要加解释。"
 
         user_prompt = f"请润色以下内容：\n\n{raw_text}"
         return self.chat(system_prompt, user_prompt, temperature=0.3)
+
+    def repair_words(self, text, terminology=None):
+        """词语修复：扫描文本中可能因语音转写出错的词，按易错词表替换为正确词，不做润色。
+
+        Args:
+            text: 待修复的文本
+            terminology: 可选，易错词参考表
+
+        Returns:
+            修复后的文本
+        """
+        system_prompt = (
+            "你是一名语音转写错误修复助手。用户提供的文本是语音转写结果，"
+            "可能存在词汇识别错误（同音字、近音字、专有名词被识别成普通词等）。\n"
+            "请扫描全文，将可疑的错误词汇替换为正确词汇。\n"
+            "原则：\n"
+            "1. 仅修改可疑的错词，不做润色、不重写句子\n"
+            "2. 保留原文的句式、标点、段落、空白结构\n"
+            "3. 拿不准的词不要改，避免引入新错误\n"
+            "4. 不要添加任何解释或前后缀，只输出修复后的文本"
+        )
+        if terminology:
+            system_prompt += (
+                f"\n\n以下是用户提供的易错词参考表，请优先把文本中近似但拼写错误的词"
+                f"替换成这些正确版本：\n{terminology}"
+            )
+
+        user_prompt = f"请修复以下文本中的语音转写错词：\n\n{text}"
+        return self.chat(system_prompt, user_prompt, temperature=0.2)
