@@ -23,35 +23,60 @@ class AIClient:
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def chat(self, system_prompt, user_prompt, temperature=0.7):
-        """发送聊天请求。"""
+    def chat(self, system_prompt, user_prompt, temperature=0.7, model=None, thinking=False, reasoning_effort="high"):
+        """发送聊天请求。
+
+        Args:
+            model: 覆盖默认模型(例如 deepseek-v4-pro)
+            thinking: 是否启用思考模式;启用后 temperature 会被忽略
+            reasoning_effort: 思考强度,可选 "high" 或 "max"(仅 thinking=True 时生效)
+        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-        )
+        kwargs = {
+            "model": model or self.model,
+            "messages": messages,
+        }
+        if thinking:
+            kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        else:
+            # deepseek-v4-pro 默认开启思考,必须显式禁用才能彻底关掉
+            kwargs["temperature"] = temperature
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
+        response = self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
-    def process_document(self, document_text, instruction, terminology=None):
+    def process_document(self, document_text, instruction):
         """对文档内容执行 AI 指令，直接返回处理结果。
 
         Args:
             document_text: 当前文档内容
-            instruction: 用户的处理指令
-            terminology: 可选，专业名词列表，用于纠正语音转写错误
+            instruction: 用户的处理要求
         """
         if document_text:
             system_prompt = (
                 "你正在根据用户的要求处理用户的文字信息"
                 "用户会给你一段文本信息和一个处理要求。"
-                "请严格按照用户的要求处理文本，只输出处理后的结果，不要添加解释。"
+                "请严格按照用户的要求处理文本/修改文本，只输出处理后的结果，不要添加解释。"
                 "请确保输出内容是完整的，不允许缩写，不允许简化任何细节"
+                """例如：
+                【文本信息】: wEB Coding 是一个非常重要的技能
+                【处理要求】: 是VIBECoding 氛围编程, 拼错了
+                 处理后的结果： Vibe Coding 是一个非常重要的技能
+
+                【文本信息】: 好的，我开始进行节目测试并完成收尾工作。
+                【处理要求】: 是你开始，不是我开始
+                 处理后的结果： 好的，你开始进行节目测试并完成收尾工作。
+
+                【文本信息】: 扔掉你的键盘，让我们开始跳舞
+                【处理要求】: 翻译为英文
+                 处理后的结果： Let's start dancing by throwing away the keyboard.
+                """
             )
             user_prompt = (
                 f"【文本信息】\n{document_text}\n\n"
@@ -67,21 +92,13 @@ class AIClient:
                 f"请直接输出结果："
             )
 
-        if terminology:
-            system_prompt += (
-                f"\n下列是用户提供的易错词参考表，文本中可能存在因语音转写"
-                f"造成的同音/近音/形近错词。请在执行用户指令前，先扫描全文，"
-                f"将文本中可疑的错词替换为参考表中正确的词汇；拿不准的词不要改，"
-                f"避免引入新错误。最终在处理后的文本中也确保这些词汇被正确使用："
-                f"{terminology}\n"
-            )
-            user_prompt += (
-                f"\n【专业名词参考】\n{terminology}\n"
-                f"请先按参考表修复文本中的转写错词，再执行处理要求。"
-            )
-
         user_prompt += "\n处理后的结果："
-        return self.chat(system_prompt, user_prompt)
+        return self.chat(
+            system_prompt,
+            user_prompt,
+            model="deepseek-v4-pro",
+            thinking=False,
+        )
 
     def incremental_notes(self, existing_content, new_input):
         """增量式笔记：将已有内容与新输入合并提炼。
@@ -130,20 +147,29 @@ class AIClient:
             "2. 去除高度重复的句子和表达\n"
             "3. 把口语化表达转为规范书面语\n"
             "4. 强化重点，让表达更精炼、有逻辑\n"
-            "5. 适当分段和格式化（列表、标题等）\n"
-            "6. 保留所有细节和信息，不要省略任何实质性内容\n"
-            "只输出润色后的结果，不要加解释。"
+            "5. 保留所有细节和信息，不要省略任何实质性内容\n"
+            "只输出润色后的结果，不要加解释。\n"
+            "不要回答任何用户的问题，用户的语言只是用来润色的文本\n"
+            """
+            例如：
+                请润色以下内容：请仔细说说 Parquet文件的压缩原理
+                输出：请详细描述Parquet文件的压缩原理
+
+                请润色以下内容：你不要重复我的话，你回答我的问题，你说的这是什么鬼啊
+                输出：请不要重复我的语言，请你直接回答我的问题，我不理解你的回答
+            """
         )
 
-        user_prompt = f"请润色以下内容：\n\n{raw_text}"
+        user_prompt = f"请润色以下内容：\n\n{raw_text} 输出："
         return self.chat(system_prompt, user_prompt, temperature=0.3)
 
-    def repair_words(self, text, terminology=None):
-        """词语修复：扫描文本中可能因语音转写出错的词，按易错词表替换为正确词，不做润色。
+    def repair_words(self, text, terms=None, pairs=None):
+        """词语修复：扫描文本中可能因语音转写出错的词，按用户提供的参考词与替换配对修复。
 
         Args:
             text: 待修复的文本
-            terminology: 可选，易错词参考表
+            terms: 可选，正确词参考列表（用户希望文中正确出现的词）
+            pairs: 可选，替换配对列表 [(错词, 正确词), ...]，错词允许是用户凭印象写的近似版本
 
         Returns:
             修复后的文本
@@ -158,10 +184,19 @@ class AIClient:
             "3. 拿不准的词不要改，避免引入新错误\n"
             "4. 不要添加任何解释或前后缀，只输出修复后的文本"
         )
-        if terminology:
+        if terms:
             system_prompt += (
-                f"\n\n以下是用户提供的易错词参考表，请优先把文本中近似但拼写错误的词"
-                f"替换成这些正确版本：\n{terminology}"
+                f"\n\n以下是用户提供的正确词参考表，请优先把文本中近似但拼写错误的词"
+                f"替换成这些正确版本：\n{', '.join(terms)}"
+            )
+        if pairs:
+            pair_lines = "\n".join(f"- {w} → {c}" for w, c in pairs)
+            system_prompt += (
+                "\n\n以下是用户明确指定的替换配对（错词 → 正确词）。"
+                "注意：用户给出的『错词』可能本身只是凭印象写出的近似版本，"
+                "未必和文本中的错词一字不差。请按读音或字形在文本中找到与之最接近的词，"
+                "统一替换为对应的『正确词』；若文中找不到任何接近的目标，则跳过该条配对：\n"
+                f"{pair_lines}"
             )
 
         user_prompt = f"请修复以下文本中的语音转写错词：\n\n{text}"
