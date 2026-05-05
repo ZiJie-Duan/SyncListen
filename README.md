@@ -1,115 +1,174 @@
 # SyncListen
 
-**极简语音工作流 — 一次运行，一个会话，退出不保存。**
+**A minimalist voice-to-text workflow — one run, one session, no auto-save.**
 
-[English](#english) | [中文](#中文)
+[中文版 / Chinese](README.zh-CN.md)
 
 ---
 
-## 中文
+## What is it
 
-### 是什么
+SyncListen turns spoken words into polished, copy-ready text in the fewest keystrokes possible. It is designed for Sway/Linux but runs anywhere a microphone, Python, and a clipboard tool exist.
 
-SyncListen 是一个为 Sway/Linux 设计的极简语音速记工具。核心理念：**最快路径把你说的话变成整理好的文字**。
+The whole UX is one screen, one keystroke per action, no menus:
 
-- 按 **回车** → 录音 → 自动转写润色 → 内容追加 → 自动复制剪贴板
-- 按 **A** → 录音说指令 → AI 按指令处理当前内容
-- 按 **Z/X** → 撤销 / 重做
-- 按 **D** → 清空当前内容
-- 按 **C** → 手动复制到剪贴板
-- 按 **Q** → 退出
+| Key | Mode | What it does |
+|---|---|---|
+| `Enter` | **Write** | Record → transcribe → AI polish → append → auto-copy |
+| `E` | **Edit** | Open current content in `$EDITOR` |
+| `A` | **AI instruction** | Speak an instruction → AI rewrites the current content |
+| `F` | **Term repair** | AI scans the whole text and fixes voice-recognition errors (supports user-supplied reference terms and `wrong=right` pairs) |
+| `T` | **Terminology** | Add/remove/list the persistent reference-term list used by `F` |
+| `D` | **Clear** | Empty the current content (undoable) |
+| `Z` / `X` | Undo / Redo | Step backward / forward through the history stack |
+| `C` | **Copy** | Manually copy the current content to clipboard |
+| `Q` | **Quit** | Exit the session (nothing is auto-saved) |
 
-没有文档管理、没有持久化、没有复杂菜单。打开就用，用完就走。
+The terminology list (managed via `T`) is the only thing persisted between runs.
 
-### 环境要求
-
-- Python 3.9+
-- Linux (Wayland 或 X11)
-- 麦克风
-
-### 安装
-
-**1. 克隆仓库**
+## Quick start
 
 ```bash
 git clone https://github.com/ZiJie-Duan/SyncListen.git ~/SyncListen
 cd ~/SyncListen
+
+# 1. System packages
+sudo apt install libportaudio2 xclip wl-clipboard
+
+# 2. Python deps (install CPU-only torch first if you have no NVIDIA GPU)
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+
+# 3. (Optional) AI key
+echo 'OPENAI_API_KEY=sk-...' > .env
+
+# 4. (Optional) Editor enhancement — see "Edit mode enhancement" below
+bash scripts/setup-editor-nvim.sh
+
+# 5. Run
+./run.sh
 ```
 
-**2. 安装系统依赖**
+The first launch downloads the SenseVoiceSmall ASR model (~300 MB) into `~/.cache/modelscope/`. One-time cost.
+
+## Stack overview
+
+Everything SyncListen depends on, in one table.
+
+| Layer | Component | Source | License | Purpose |
+|---|---|---|---|---|
+| Runtime | Python ≥ 3.9 | system | PSF | language runtime |
+| System | `libportaudio2` | apt | MIT | PortAudio runtime for `sounddevice` |
+| System | `xclip` | apt | GPL-2 | X11 clipboard backend |
+| System | `wl-clipboard` | apt | GPL-2 | Wayland clipboard backend |
+| Python | `funasr` | PyPI | MIT | Inference framework for SenseVoice |
+| Python | `torch`, `torchaudio` | PyPI | BSD-3 | Tensor backend (CPU build recommended on no-GPU hosts) |
+| Python | `numpy` | PyPI | BSD-3 | Audio buffer math |
+| Python | `sounddevice` | PyPI | MIT | Microphone capture |
+| Python | `openai` | PyPI | Apache-2.0 | OpenAI-compatible API client |
+| Python | `python-dotenv` | PyPI | BSD-3 | `.env` loader |
+| Python | `modelscope` | PyPI | Apache-2.0 | Model downloader for SenseVoice |
+| Model | **SenseVoiceSmall** | ModelScope, auto-downloaded on first run | Apache-2.0 | Multilingual ASR (zh / en / yue / ja / ko) |
+| AI | OpenAI-compatible chat API (default: DeepSeek `deepseek-chat`) | per-vendor | per-vendor | Polishing in Write mode, instructions in A mode, term repair in F mode |
+| Editor (optional) | Neovim ≥ 0.10 | upstream | Apache-2.0 | Backend for `[E]` edit mode |
+| Editor (optional) | `folke/lazy.nvim` | GitHub | Apache-2.0 | Plugin manager (auto-bootstrapped) |
+| Editor (optional) | `folke/flash.nvim` | GitHub | Apache-2.0 | Search-label jumping |
+| Editor (optional) | `mozillazg/pinyin-data` | GitHub | MIT | Source for the embedded Han→pinyin-initial table at `etc/nvim/lua/pyinitial_data.lua` |
+
+## Persistent state
+
+SyncListen never auto-saves session content, but it does maintain a few on-disk artifacts. None contain secrets; all are safe to back up wholesale.
+
+| Path | What lives there | Safe to delete? |
+|---|---|---|
+| `~/.config/synclisten/terminology.json` | Reference-term list (managed via `T`) | You lose your custom term list |
+| `~/.local/state/synclisten/edit/` | Edit-mode drafts. Kept on abnormal editor exit so nothing is lost; pruned to the most recent 20 | Yes — only unrecovered drafts |
+| `~/.cache/modelscope/` | SenseVoiceSmall model weights (~300 MB) | Yes — re-downloaded on next run |
+| `~/.config/synclisten-nvim/` | Optional Neovim profile for `[E]` mode | Yes — re-run `scripts/setup-editor-nvim.sh` |
+| `~/.local/share/synclisten-nvim/lazy/` | Plugins managed by lazy.nvim | Yes — auto re-fetched on next nvim start |
+| `~/.local/state/synclisten-nvim/undo/` | Persistent undo history of edited drafts | Yes — but undo across past sessions is lost |
+
+The edit-mode draft directory and the persistent undo store are the two layers of recovery insurance for `[E]` mode: if Neovim crashes, the draft file is **not** deleted, and Neovim's undo file lets you replay every change.
+
+## Edit mode enhancement (optional)
+
+Out of the box, `[E]` opens whatever `$EDITOR` points at, falling back to `vi`. The repo also ships an opinionated, sandboxed Neovim profile that gives you a flash.nvim-powered jump-to-word experience, including **Chinese-aware pinyin-initial jumping** without learning a shuangpin (双拼) layout.
+
+> **A note on the helper scripts.** `scripts/setup-editor-nvim.sh` and `scripts/gen-pyinitial-data.py` were validated only on the author's setup (Pop!_OS / Linux, bash, Neovim ≥ 0.10). On other distributions, shells, or Neovim versions they may need small adjustments — different package names, missing dependencies, paths that differ from the XDG defaults, etc.
+>
+> If a script fails for you, **don't try to debug it by hand**. Each script is short, self-contained, and easy for an AI assistant (Claude, ChatGPT, …) to patch. Paste the script's source plus the exact error output into the assistant and ask "please make this work on \<my OS / shell / nvim version\>". You should not need to understand pinyin tables, vim internals, or lazy.nvim's bootstrap protocol to get the editor enhancement working.
+
+### What you get
+
+- A dedicated Neovim profile under `~/.config/synclisten-nvim/`, isolated from your everyday `~/.config/nvim/` via `NVIM_APPNAME`.
+- `flash.nvim` mapped to `s` in normal/visual/operator-pending modes, configured so a small **pinyin-initial matcher** (`etc/nvim/lua/pyinitial.lua`) expands every typed letter into a vim character class containing all Chinese characters whose pinyin starts with that letter — so `s zw` jumps to "中文", "找位", and any other 2-character Chinese run beginning with z + w initials.
+- **Uppercase jump labels** (`A`–`Z`) so lowercase pinyin input never collides with label keys.
+- Persistent undo enabled, swap files disabled — drafts stay recoverable.
+
+### Install
 
 ```bash
-# Ubuntu / Debian / Pop!_OS
-sudo apt install libportaudio2 xclip wl-clipboard
+# 1. Install Neovim ≥ 0.10
+sudo apt install neovim
+# or fetch a recent build:
+curl -LO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage
+chmod +x nvim-linux-x86_64.appimage && sudo mv nvim-linux-x86_64.appimage /usr/local/bin/nvim
+
+# 2. Install the SyncListen profile (idempotent)
+bash scripts/setup-editor-nvim.sh
+
+# 3. Add to your shell rc (~/.bashrc / ~/.zshrc / fish config)
+export EDITOR='env NVIM_APPNAME=synclisten-nvim nvim'
+
+# 4. Reload your shell, run SyncListen, press E
 ```
 
-| 包 | 用途 |
+### Use
+
+| Input | Effect |
 |---|---|
-| `libportaudio2` | 麦克风录音运行时库 |
-| `xclip` | X11 剪贴板 |
-| `wl-clipboard` | Wayland 剪贴板 |
+| `s` | Activate flash.nvim search |
+| `s z` | Highlight every Chinese char whose pinyin starts with `z` (中, 找, 在, 自…), plus literal `z`/`Z` |
+| `s zw` | Highlight every "z-initial char + w-initial char" run (中文, 找位, 自我…) |
+| `Shift+<label>` | Jump to a labeled match (labels are uppercase to avoid colliding with lowercase pinyin input) |
+| `v` then `s zw` | Same, but extend the visual selection — your standard "select a Chinese word" move |
+| `s abc` | Falls back to literal ASCII matching, so code/English still works the way you expect |
+| `<leader>w` (`Space w`) | `:wq` — save and return to SyncListen |
 
-**3. 安装 Python 依赖**
+### Layout
+
+```
+etc/nvim/
+├── init.lua                  # Profile entry; bootstraps lazy.nvim, sets undo/swap policy, loads flash
+└── lua/
+    ├── pyinitial.lua         # The flash search.mode hook
+    └── pyinitial_data.lua    # Embedded Han→pinyin-initial table (~77 KB, 25 721 chars in U+4E00–U+9FFF)
+```
+
+`pyinitial_data.lua` is generated from `mozillazg/pinyin-data`. End users do **not** need to regenerate it. Maintainers can refresh the table with:
 
 ```bash
-pip install -r requirements.txt
+python3 scripts/gen-pyinitial-data.py
+# or, from a local copy of pinyin.txt:
+python3 scripts/gen-pyinitial-data.py --source /path/to/pinyin.txt
 ```
 
-> **注意**：默认 `torch` 是 CUDA 版（非常大）。如果你的机器没有 NVIDIA GPU，建议安装 CPU 版以节省时间和空间：
-> ```bash
-> pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-> pip install -r requirements.txt
-> ```
+## Sway integration (optional)
 
-**4. 配置 AI API（可选）**
-
-没有 API Key 也能使用，只是 **A 模式（AI 指令）不可用**，回车模式的润色功能也会回退到原始转写。
-
-在项目根目录创建 `.env`：
-
-```bash
-OPENAI_API_KEY=sk-your-key-here
-# 以下可选，不填则使用 DeepSeek 默认值
-# OPENAI_BASE_URL=https://api.deepseek.com/v1
-# AI_MODEL=deepseek-chat
-```
-
-### 启动
-
-```bash
-cd ~/SyncListen
-./run.sh
-```
-
-或直接用 Python：
-
-```bash
-python main.py
-```
-
-第一次启动时，会自动从 ModelScope 下载 SenseVoiceSmall 模型（约 300MB），只需一次。模型缓存位于 `~/.cache/modelscope/`。
-
-### Sway 集成（可选）
-
-将以下加入 `~/.config/sway/config`：
-
-```
+```text
+# ~/.config/sway/config
 bindsym $mod+p exec ~/bin/sway-synclisten
 ```
 
-创建启动脚本 `~/bin/sway-synclisten`：
-
 ```bash
+# ~/bin/sway-synclisten
 #!/bin/bash
-
-# 已存在？直接聚焦
 if swaymsg -t get_tree | jq -e '.. | .app_id? == "synclisten"' | grep -q true; then
     swaymsg '[app_id="synclisten"] focus'
     exit 0
 fi
-
 swaymsg splith
-swaymsg exec 'foot --app-id=synclisten -e /bin/bash -ic "cd ~/SyncListen \&\& ./run.sh; bash"'
+swaymsg exec 'foot --app-id=synclisten -e /bin/bash -ic "cd ~/SyncListen && ./run.sh; bash"'
 sleep 0.5
 swaymsg resize set width 20 ppt
 ```
@@ -118,194 +177,44 @@ swaymsg resize set width 20 ppt
 chmod +x ~/bin/sway-synclisten
 ```
 
-按 **Super+P** 打开侧栏窗口（已存在则聚焦），SynListen 会在右侧以 20% 宽度启动。
+`Super+P` opens (or focuses) a 20%-wide foot terminal running SyncListen.
 
-### 使用场景
+## Environment variables
 
-| 场景 | 操作 |
-|------|------|
-| 快速记想法 | 回车 → 说话 → 回车停止 |
-| 整理已有内容 | A → "总结成三点" → 回车 |
-| 写错了 | Z 撤销 |
-| 要清屏 | D 清空（可撤销） |
-| 粘贴到别处 | C 复制（每次写入后已自动复制） |
+| Variable | Required | Default | Effect |
+|---|---|---|---|
+| `OPENAI_API_KEY` | optional | — | If unset, `[A]` and `[F]` are unavailable; Write mode falls back to raw transcription with no AI polish |
+| `OPENAI_BASE_URL` | optional | `https://api.deepseek.com/v1` | Any OpenAI-compatible endpoint |
+| `AI_MODEL` | optional | `deepseek-chat` | Model name passed to the AI endpoint |
+| `EDITOR` | optional | `vi` | Editor binary used by `[E]`. Set to `env NVIM_APPNAME=synclisten-nvim nvim` for the editor enhancement |
+| `VISUAL` | optional | — | Honored as a fallback if `EDITOR` is unset |
+| `XDG_STATE_HOME` | optional | `~/.local/state` | Root of the edit-draft directory |
+| `MODELSCOPE_CACHE` | optional | `~/.cache/modelscope` | SenseVoice model cache |
+| `WAYLAND_DISPLAY` / `DISPLAY` | auto | — | Detected at runtime to choose `wl-copy` vs `xclip` |
 
-### 项目结构
+The `.env` file at the repo root is loaded via `python-dotenv` and is the recommended place for `OPENAI_*` and `AI_MODEL`.
 
-```
-SyncListen/
-├── main.py                  # 入口
-├── run.sh                   # 启动脚本
-├── requirements.txt         # Python 依赖
-├── synclisten/
-│   ├── config.py            # 全局配置
-│   └── core/
-│       ├── recorder.py      # 音频录制
-│       ├── transcriber.py   # SenseVoice 转写
-│       └── ai_client.py     # AI API 客户端
-└── .env                     # API Key（不提交到 git）
-```
+## FAQ
 
-### 常见问题
+**Can I run without an AI key?** Yes. Write mode emits raw transcription; `A` and `F` are disabled. Everything else (record, transcribe, edit, undo, terminology) still works.
 
-**Q: 没有 API Key 能用吗？**
-A: 能。回车模式会跳过 AI 润色，直接输出原始转写文字。只有 A 模式（AI 指令）完全不可用。
+**The model download is slow / fails.** ModelScope uses a regional mirror by default. Set `MODELSCOPE_CACHE` to retry into a fresh directory, or pre-fetch the model with the `modelscope` CLI before running.
 
-**Q: 模型下载太慢/失败？**
-A: ModelScope 默认从国内镜像下载。如果仍然慢，可以设置环境变量 `export MODELSCOPE_CACHE=~/.cache/modelscope` 指定缓存路径，或检查网络连接。
+**Can I use a non-DeepSeek backend?** Yes — anything OpenAI-compatible. Set `OPENAI_BASE_URL` and `AI_MODEL` in `.env`.
 
-**Q: 可以用其他 AI 服务吗？**
-A: 可以。任何兼容 OpenAI API 格式的服务都可以，修改 `.env` 中的 `OPENAI_BASE_URL` 和 `AI_MODEL` 即可。
+**An edit crashed Neovim. Did I lose work?** No. The draft file at `~/.local/state/synclisten/edit/edit-<timestamp>.md` is preserved on any abnormal exit and the path is shown in the SyncListen status line. Open it in any editor; persistent undo history is at `~/.local/state/synclisten-nvim/undo/`.
 
----
+**Can I use the pinyin matcher with my regular nvim config?** Yes. Copy `etc/nvim/lua/pyinitial.lua` and `etc/nvim/lua/pyinitial_data.lua` into your runtime path and route `flash.jump`'s `search.mode` option to `require("pyinitial").mode`. `init.lua` is a worked example.
 
-## English
+## Acknowledgements
 
-### What is it
+This project stands on the shoulders of:
 
-SyncListen is a minimalist voice-to-text workflow tool for Sway/Linux. Core idea: **fastest path from speech to polished text**.
+- [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) and [funasr](https://github.com/modelscope/FunASR) for the local ASR pipeline.
+- [DeepSeek](https://www.deepseek.com/) for an affordable OpenAI-compatible chat API.
+- [folke/lazy.nvim](https://github.com/folke/lazy.nvim) and [folke/flash.nvim](https://github.com/folke/flash.nvim) for the editor enhancement.
+- [mozillazg/pinyin-data](https://github.com/mozillazg/pinyin-data) for the public-domain-grade pinyin table that powers `pyinitial_data.lua`.
 
-- Press **Enter** → record → transcribe → AI polish → append → auto-copy to clipboard
-- Press **A** → speak an instruction → AI processes current content
-- Press **Z/X** → undo / redo
-- Press **D** → clear content (undoable)
-- Press **C** → copy to clipboard
-- Press **Q** → quit
+## License
 
-No document management, no persistence, no complex menus. Open, use, close.
-
-### Requirements
-
-- Python 3.9+
-- Linux (Wayland or X11)
-- Microphone
-
-### Installation
-
-**1. Clone**
-
-```bash
-git clone https://github.com/ZiJie-Duan/SyncListen.git ~/SyncListen
-cd ~/SyncListen
-```
-
-**2. System dependencies**
-
-```bash
-# Ubuntu / Debian / Pop!_OS
-sudo apt install libportaudio2 xclip wl-clipboard
-```
-
-| Package | Purpose |
-|---------|---------|
-| `libportaudio2` | Microphone recording runtime |
-| `xclip` | X11 clipboard |
-| `wl-clipboard` | Wayland clipboard |
-
-**3. Python dependencies**
-
-```bash
-pip install -r requirements.txt
-```
-
-> **Note**: The default `torch` from PyPI is the CUDA version (very large). If you don't have an NVIDIA GPU, install the CPU version to save time and disk space:
-> ```bash
-> pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-> pip install -r requirements.txt
-> ```
-
-**4. Configure AI API (optional)**
-
-You can use SyncListen without an API Key — the **A mode (AI instruction)** will be unavailable, and Enter mode will fall back to raw transcription without AI polish.
-
-Create `.env` in the project root:
-
-```bash
-OPENAI_API_KEY=sk-your-key-here
-# Optional — defaults to DeepSeek if omitted
-# OPENAI_BASE_URL=https://api.deepseek.com/v1
-# AI_MODEL=deepseek-chat
-```
-
-### Launch
-
-```bash
-cd ~/SyncListen
-./run.sh
-```
-
-Or directly with Python:
-
-```bash
-python main.py
-```
-
-On first launch, the SenseVoiceSmall model (~300MB) will be auto-downloaded from ModelScope. One time only. Model cache is at `~/.cache/modelscope/`.
-
-### Sway Integration (optional)
-
-Add to `~/.config/sway/config`:
-
-```
-bindsym $mod+p exec ~/bin/sway-synclisten
-```
-
-Create the launcher script `~/bin/sway-synclisten`:
-
-```bash
-#!/bin/bash
-
-# Already open? Just focus
-if swaymsg -t get_tree | jq -e '.. | .app_id? == "synclisten"' | grep -q true; then
-    swaymsg '[app_id="synclisten"] focus'
-    exit 0
-fi
-
-swaymsg splith
-swaymsg exec 'foot --app-id=synclisten -e /bin/bash -ic "cd ~/SyncListen \&\& ./run.sh; bash"'
-sleep 0.5
-swaymsg resize set width 20 ppt
-```
-
-```bash
-chmod +x ~/bin/sway-synclisten
-```
-
-Press **Super+P** to open the side panel (or focus if already open). SyncListen starts on the right at 20% width.
-
-### Use Cases
-
-| Scenario | Action |
-|----------|--------|
-| Quick note | Enter → speak → Enter to stop |
-| Process existing content | A → "summarize in 3 points" → Enter |
-| Made a mistake | Z to undo |
-| Clear the screen | D to clear (undoable) |
-| Paste elsewhere | C to copy (already auto-copied on every write) |
-
-### Project Structure
-
-```
-SyncListen/
-├── main.py                  # Entry point
-├── run.sh                   # Launcher script
-├── requirements.txt         # Python dependencies
-├── synclisten/
-│   ├── config.py            # Global config
-│   └── core/
-│       ├── recorder.py      # Audio recording
-│       ├── transcriber.py   # SenseVoice transcription
-│       └── ai_client.py     # AI API client
-└── .env                     # API Key (do not commit)
-```
-
-### FAQ
-
-**Q: Can I use it without an API Key?**
-A: Yes. Enter mode will output raw transcription without AI polish. A mode (AI instruction) will be unavailable.
-
-**Q: Model download is slow / fails?**
-A: ModelScope downloads from its default mirror. You can set `export MODELSCOPE_CACHE=~/.cache/modelscope` to specify a cache path, or check your network.
-
-**Q: Can I use a different AI service?**
-A: Yes. Any service with an OpenAI-compatible API works. Just change `OPENAI_BASE_URL` and `AI_MODEL` in `.env`.
+See [LICENSE](LICENSE).

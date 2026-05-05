@@ -6,8 +6,8 @@ SyncListen — 极简语音工作流
 
 [回车] 写入模式  — 直接录音，AI润色后追加
 [E]    编辑模式  — 用 $EDITOR 直接编辑当前内容
-[A]    AI 指令   — 语音指令，AI处理当前内容（含词语修复）
-[F]    词语修复  — AI 扫描全文修复语音转写错词（参考易错词表）
+[A]    AI 指令   — 语音指令，AI处理当前内容
+[F]    词语修复  — AI 扫描全文修复语音转写错词（支持补充参考词与替换配对）
 [T]    易错词    — 管理持久化易错词表（增/删/查）
 [D]    清空      — 清空当前内容（可撤销）
 [Z]    撤销      — 回滚到上一版本
@@ -15,7 +15,7 @@ SyncListen — 极简语音工作流
 [C]    复制      — 手动复制到剪贴板
 [Q]    退出
 
-易错词通过 [T] 管理后会持久化保存，作为 [F] 词语修复与 [A] AI 指令的参考词表
+易错词通过 [T] 管理后会持久化保存，作为 [F] 词语修复的参考词表
 """
 
 import os
@@ -23,7 +23,6 @@ import shlex
 import shutil
 import sys
 import subprocess
-import tempfile
 import textwrap
 import time
 
@@ -275,7 +274,7 @@ def _read_input_line(session, transient=""):
             redraw(session, transient=transient, input_buffer=buf)
 
 
-def cmd_write(session, recorder, transcriber, ai_client, terminology_store):
+def cmd_write(session, recorder, transcriber, ai_client):
     """写入模式：录音 → 转写 → AI 润色 → 追加。词语修复请用 [F]。"""
     redraw(session, hint="🔴 录音中… 按回车停止")
     recorder.start()
@@ -292,7 +291,6 @@ def cmd_write(session, recorder, transcriber, ai_client, terminology_store):
         redraw(session, hint="⚠️ 未识别到文字")
         return
 
-    # AI 润色（不再注入易错词，由 [F] 单独负责词语修复）
     if ai_client is not None:
         redraw(session, transient=raw_text, hint="⏳ 润色中…")
         try:
@@ -311,8 +309,8 @@ def cmd_write(session, recorder, transcriber, ai_client, terminology_store):
     redraw(session, hint=f"✅ 已写入 ({len(session.content)}字)")
 
 
-def cmd_ai(session, recorder, transcriber, ai_client, terminology_store):
-    """AI 指令模式：录音为指令 → AI 处理（含词语修复） → 覆盖内容，压入历史。"""
+def cmd_ai(session, recorder, transcriber, ai_client):
+    """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史。"""
     redraw(session, hint="🔴 说出指令… 按回车停止")
     recorder.start()
     _wait_for_enter()
@@ -328,13 +326,9 @@ def cmd_ai(session, recorder, transcriber, ai_client, terminology_store):
         redraw(session, hint="⚠️ 未识别到文字")
         return
 
-    terminology = terminology_store.as_string() or None
-
     redraw(session, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
     try:
-        result = ai_client.process_document(
-            session.content, instruction, terminology=terminology
-        )
+        result = ai_client.process_document(session.content, instruction)
         session.commit(result)
         copy_to_clipboard(session.content)
         redraw(session, hint="✅ AI 已覆盖")
@@ -342,68 +336,111 @@ def cmd_ai(session, recorder, transcriber, ai_client, terminology_store):
         redraw(session, hint=f"❌ {e}")
 
 
-def cmd_compose(session):
-    """编辑模式：用 $EDITOR 直接编辑当前内容，保存退出后提交到历史。"""
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+def _edit_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    d = os.path.join(base, "synclisten", "edit")
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    fd, tmppath = tempfile.mkstemp(prefix="synclisten-", suffix=".txt")
+
+def _prune_edit_dir(keep=20):
+    """保留最近 keep 份草稿，多余的按 mtime 从旧到新清理。"""
+    d = _edit_dir()
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(session.content)
-
+        entries = sorted(
+            (os.path.join(d, n) for n in os.listdir(d) if n.startswith("edit-")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+    except OSError:
+        return
+    for p in entries[keep:]:
         try:
-            cmd = shlex.split(editor) + [tmppath]
-            rc = subprocess.run(cmd).returncode
-        except FileNotFoundError:
-            redraw(session, hint=f"❌ 找不到编辑器：{editor}")
-            return
-
-        if rc != 0:
-            redraw(session, hint=f"⚠️ 编辑器异常退出 (rc={rc})")
-            return
-
-        with open(tmppath, "r", encoding="utf-8") as f:
-            new_content = f.read()
-    finally:
-        try:
-            os.unlink(tmppath)
+            os.unlink(p)
         except OSError:
             pass
+
+
+def cmd_compose(session):
+    """编辑模式：用 $EDITOR 直接编辑当前内容，保存退出后提交到历史。
+
+    草稿写入 ~/.local/state/synclisten/edit/，仅在 commit 成功或确认无变更后删除；
+    异常退出时保留文件以便恢复。
+    """
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+
+    _prune_edit_dir()
+    edit_dir = _edit_dir()
+    fname = f"edit-{int(time.time() * 1000)}-{os.getpid()}.md"
+    path = os.path.join(edit_dir, fname)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(session.content)
+
+    try:
+        cmd = shlex.split(editor) + [path]
+        rc = subprocess.run(cmd).returncode
+    except FileNotFoundError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        redraw(session, hint=f"❌ 找不到编辑器：{editor}")
+        return
+
+    if rc != 0:
+        redraw(session, hint=f"⚠️ 编辑器异常退出 (rc={rc})  草稿保留：{path}")
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            new_content = f.read()
+    except OSError as e:
+        redraw(session, hint=f"❌ 读取草稿失败：{e}  路径：{path}")
+        return
 
     # 编辑器通常会在末尾自动追加一个换行,去掉再做对比,避免误判为有变更
     if new_content.endswith("\n"):
         new_content = new_content[:-1]
 
     if new_content == session.content:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         redraw(session, hint="ℹ️ 内容未变")
         return
 
     session.commit(new_content)
     copy_to_clipboard(session.content)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
     redraw(session, hint=f"✅ 已编辑 ({len(session.content)}字)")
 
 
 def cmd_repair(session, ai_client, terminology_store):
-    """词语修复：AI 扫全文修复语音转写错词，参考易错词表。支持临时补充词汇。"""
+    """词语修复：AI 扫全文修复语音转写错词。支持补充参考词与替换配对。"""
     if not session.content:
         redraw(session, hint="⚠️ 内容为空")
         return
 
-    # 允许用户临时补充词汇
-    extra_terms = _read_input_line(
-        session, transient="🔧 词语修复：输入临时补充词汇（空格分隔），直接回车则仅用词表"
+    raw = _read_input_line(
+        session,
+        transient="🔧 词语修复：用逗号分隔；单词为补充参考，错词=正确词为替换配对",
     )
+    extra_terms, pairs = _parse_repair_input(raw)
 
-    # 合并持久化术语表和临时词汇
-    persistent = terminology_store.as_string() or ""
-    if extra_terms:
-        terminology = f"{persistent} {extra_terms}".strip() if persistent else extra_terms
-    else:
-        terminology = persistent or None
+    terms = list(terminology_store.list()) + extra_terms
 
     redraw(session, hint="⏳ 词语修复中…")
     try:
-        result = ai_client.repair_words(session.content, terminology=terminology)
+        result = ai_client.repair_words(
+            session.content,
+            terms=terms or None,
+            pairs=pairs or None,
+        )
     except Exception as e:
         redraw(session, hint=f"❌ {e}")
         return
@@ -415,6 +452,27 @@ def cmd_repair(session, ai_client, terminology_store):
     session.commit(result)
     copy_to_clipboard(session.content)
     redraw(session, hint=f"🔧 已修复 ({len(session.content)}字)")
+
+
+def _parse_repair_input(raw):
+    """解析 [F] 输入：逗号分隔，含 '=' 的 token 解析为 (错词, 正确词) 配对，其余为补充参考词。"""
+    if not raw:
+        return [], []
+    terms = []
+    pairs = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            wrong, _, correct = token.partition("=")
+            wrong = wrong.strip()
+            correct = correct.strip()
+            if wrong and correct:
+                pairs.append((wrong, correct))
+        else:
+            terms.append(token)
+    return terms, pairs
 
 
 def cmd_undo(session):
@@ -629,14 +687,14 @@ def main():
         choice = ch.lower()
 
         if choice == "\r" or choice == "\n":
-            cmd_write(session, recorder, transcriber, ai_client, terminology_store)
+            cmd_write(session, recorder, transcriber, ai_client)
         elif choice == "e":
             cmd_compose(session)
         elif choice == "a":
             if ai_client is None:
                 redraw(session, hint="⚠️ AI 未配置")
             else:
-                cmd_ai(session, recorder, transcriber, ai_client, terminology_store)
+                cmd_ai(session, recorder, transcriber, ai_client)
         elif choice == "f":
             if ai_client is None:
                 redraw(session, hint="⚠️ AI 未配置")
