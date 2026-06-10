@@ -5,7 +5,8 @@ SyncListen — 极简语音工作流
 一次运行 = 一个会话，退出不保存
 
 模式：
-  在线模式 — 云端 Paraformer 流式转写（边录边传）+ AI 全功能；启动不加载本地模型，最快。
+  在线模式 — 云端 Qwen3-ASR-Flash 转写（带上下文注入，专名/中英混读更准）+ AI 全功能；
+            启动不加载本地模型，最快。（可配置 ONLINE_ASR_ENGINE=paraformer 切回流式低延迟引擎）
   离线模式 — 网络不可用时自动回退：本地 SenseVoice 转写，AI 功能停用、相关快捷键隐藏。
   切换：启动探测一次；在线操作失败即探测确认是否断网；离线时每次操作探测是否恢复，自动来回切换。
 
@@ -324,24 +325,40 @@ def _read_input_line(session, transient=""):
 
 
 class TranscribeEngine:
-    """统一转写引擎：在线走云端流式 Paraformer，离线/失败回退本地 SenseVoice。
+    """统一转写引擎：在线走云端 ASR（Qwen3-ASR-Flash 默认 / Paraformer 可选），
+    离线或云端失败时回退本地 SenseVoice。
 
     本地模型懒加载——在线模式从不实例化它，保证启动最快；首次掉线才加载（约 5s）。
     云端识别器无本地模型，轻量，按需创建。
+
+    online_engine：
+      "qwen"       —— Qwen3-ASR-Flash 一次性识别，带 context 注入（默认）。
+      "paraformer" —— Paraformer 流式识别，边录边传（保底/对比）。
     """
 
     def __init__(self, recorder, net, cloud_available):
         self.recorder = recorder
         self.net = net
         self.cloud_available = cloud_available  # 是否配置了 DASHSCOPE_API_KEY
+        from synclisten.config import ONLINE_ASR_ENGINE
+        self.online_engine = ONLINE_ASR_ENGINE
         self._local = None
-        self._cloud = None
+        self._cloud = None   # Paraformer 流式识别器
+        self._qwen = None    # Qwen3-ASR-Flash 一次性识别器
 
     def get_cloud(self):
+        """Paraformer 流式识别器（保底/对比引擎）。"""
         from synclisten.core.cloud_transcriber import CloudTranscriber
         if self._cloud is None:
             self._cloud = CloudTranscriber()
         return self._cloud
+
+    def get_qwen(self):
+        """Qwen3-ASR-Flash 一次性识别器（默认在线引擎，带 context）。"""
+        from synclisten.core.qwen_asr import QwenASRTranscriber
+        if self._qwen is None:
+            self._qwen = QwenASRTranscriber()
+        return self._qwen
 
     def get_local(self):
         from synclisten.core.transcriber import SenseVoiceTranscriber
@@ -358,10 +375,33 @@ def _local_transcribe(session, engine, audio):
     return text
 
 
-def _capture(session, engine, recording_hint):
+def _build_asr_context(session, terminology_store):
+    """拼装 ASR 背景文本（context），提升中英混读与专名识别。
+
+    上下文三件套：① 今天的长期记忆（块二接入，暂缺）② 已写入文稿（过长截最近窗口）
+    ③ 易错词表 [T]。仅 Qwen 引擎使用；Paraformer 不支持 context，忽略本值。
+    """
+    from synclisten.config import ASR_CONTEXT_DOC_LIMIT
+    # 标签前缀与 qwen_asr 共用：既注入，也作为回吐判别的指纹（见 _is_context_echo）。
+    from synclisten.core.qwen_asr import CONTEXT_TERMS_LABEL, CONTEXT_DOC_LABEL
+    parts = []
+    terms = list(terminology_store.list()) if terminology_store is not None else []
+    if terms:
+        parts.append(CONTEXT_TERMS_LABEL + "、".join(terms))
+    doc = (session.content or "").strip()
+    if doc:
+        if len(doc) > ASR_CONTEXT_DOC_LIMIT:
+            doc = doc[-ASR_CONTEXT_DOC_LIMIT:]
+        parts.append(CONTEXT_DOC_LABEL + "\n" + doc)
+    return "\n\n".join(parts)
+
+
+def _capture(session, engine, recording_hint, context=""):
     """录音并转写，返回 (text_or_None, note)。
 
-    在线：Paraformer 边录边传，停止即出结果；起步/中途断网则探测确认并回退本地。
+    在线（Qwen，默认）：纯录音 → 停止后整段上传识别，携带 context 提升专名/混读；
+      失败则探测确认并回退本地。
+    在线（Paraformer）：边录边传，停止即出结果；起步/中途断网则探测并回退本地。
     离线：先探测是否恢复；未恢复则本地 SenseVoice 兜底。
     过程中就地切换 engine.net 模式；note 携带模式切换提示（可空）。
     """
@@ -375,9 +415,11 @@ def _capture(session, engine, recording_hint):
         note = "🟢 网络已恢复，切回在线"
 
     use_cloud = net.is_online() and engine.cloud_available
-    cloud = None
-    on_frame = None
-    if use_cloud:
+
+    # ── Paraformer 流式路径（边录边传）──
+    if use_cloud and engine.online_engine == "paraformer":
+        cloud = None
+        on_frame = None
         try:
             cloud = engine.get_cloud()
             cloud.begin()
@@ -387,46 +429,71 @@ def _capture(session, engine, recording_hint):
             if not net.probe():
                 net.go_offline()
                 note = "⚠️ 网络不可用，已进入离线模式"
-            use_cloud = False
             cloud = None
             on_frame = None
 
+        redraw(session, net=net, hint=recording_hint)
+        recorder.start(on_frame=on_frame)
+        _wait_for_enter()
+        audio = recorder.stop()
+
+        if audio is None or len(audio) == 0:
+            if cloud is not None:
+                cloud.finalize()
+            return None, note
+
+        if cloud is not None:
+            redraw(session, net=net, hint="⏳ 转写中…")
+            text = cloud.finalize()
+            if cloud.failed or not text:
+                # 云端中途失败：探测确认，用已录 buffer 本地兜底
+                if not net.probe():
+                    net.go_offline()
+                    note = "⚠️ 网络中断，已转为离线转写"
+                text = _local_transcribe(session, engine, audio)
+            return text, note
+        # cloud 起步失败 → 本地兜底
+        return _local_transcribe(session, engine, audio), note
+
+    # ── Qwen 一次性路径 / 离线路径：先纯录音，停止后再处理 ──
     redraw(session, net=net, hint=recording_hint)
-    recorder.start(on_frame=on_frame)
+    recorder.start()
     _wait_for_enter()
     audio = recorder.stop()
 
     if audio is None or len(audio) == 0:
-        if cloud is not None:
-            cloud.finalize()
         return None, note
 
-    # 在线流式路径
-    if use_cloud and cloud is not None:
+    if use_cloud:  # Qwen3-ASR-Flash 一次性识别（带 context）
         redraw(session, net=net, hint="⏳ 转写中…")
-        text = cloud.finalize()
-        if cloud.failed or not text:
-            # 云端中途失败：探测确认，用已录 buffer 本地兜底
+        try:
+            text = engine.get_qwen().transcribe(audio, context=context)
+        except Exception:
+            # 识别失败：探测确认是否断网（无论断网与否都用 buffer 本地兜底）
             if not net.probe():
                 net.go_offline()
                 note = "⚠️ 网络中断，已转为离线转写"
-            text = _local_transcribe(session, engine, audio)
-        return text, note
+            text = ""
+        if text:
+            return text, note
+        return _local_transcribe(session, engine, audio), note
 
     # 离线 / 无云端路径
     return _local_transcribe(session, engine, audio), note
 
 
-def cmd_write(session, engine, ai_client, strong=False):
+def cmd_write(session, engine, ai_client, terminology_store=None, strong=False):
     """写入模式：录音 → 转写 →（在线时）AI 润色 → 仅把本次新话追加到末尾（不动旧文本）。
 
     Args:
+        terminology_store: 易错词表，用于拼装 ASR context（Qwen 引擎专名提示）。
         strong: False=忠实清理（去口癖语病，保留原话）；True=升华（口语转书面、精炼有逻辑）。
                 两者都只作用于本次转写，整篇润色/改写请用 [A]，错词修复请用 [F]。
                 离线时跳过 AI，直接追加原始转写（纯转写模式）。
     """
     net = engine.net
-    raw_text, note = _capture(session, engine, "🔴 录音中… 按回车停止")
+    context = _build_asr_context(session, terminology_store)
+    raw_text, note = _capture(session, engine, "🔴 录音中… 按回车停止", context=context)
     if raw_text is None:
         redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
         return
@@ -465,10 +532,11 @@ def cmd_write(session, engine, ai_client, strong=False):
     redraw(session, net=net, hint=f"✅ {label} ({len(session.content)}字){suffix}")
 
 
-def cmd_ai(session, engine, ai_client):
+def cmd_ai(session, engine, ai_client, terminology_store=None):
     """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史（仅在线）。"""
     net = engine.net
-    instruction, note = _capture(session, engine, "🔴 说出指令… 按回车停止")
+    context = _build_asr_context(session, terminology_store)
+    instruction, note = _capture(session, engine, "🔴 说出指令… 按回车停止", context=context)
     if instruction is None:
         redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
         return
@@ -841,7 +909,10 @@ def main():
         except ValueError as e:
             print(f"⚠️  AI 未配置: {e}（[S]/[A]/[F] 不可用）")
         if cloud_available:
-            print("✅ 在线模式就绪（Paraformer 云端流式转写，启动未加载本地模型）")
+            if engine.online_engine == "paraformer":
+                print("✅ 在线模式就绪（Paraformer 云端流式转写，启动未加载本地模型）")
+            else:
+                print("✅ 在线模式就绪（Qwen3-ASR-Flash 云端转写 + 上下文注入，启动未加载本地模型）")
         else:
             print("⚠️  未配置 DASHSCOPE_API_KEY：语音转写将使用本地 SenseVoice（首次约 5s 加载）")
     else:
@@ -864,14 +935,14 @@ def main():
         choice = ch.lower()
 
         if choice == "\r" or choice == "\n":
-            cmd_write(session, engine, ai_client)
+            cmd_write(session, engine, ai_client, terminology_store)
         elif choice == "s":
             if not _guard_ai(session, net, "升华"):
                 pass
             elif ai_client is None:
                 redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_write(session, engine, ai_client, strong=True)
+                cmd_write(session, engine, ai_client, terminology_store, strong=True)
         elif choice == "e":
             cmd_compose(session)
         elif choice == "a":
@@ -880,7 +951,7 @@ def main():
             elif ai_client is None:
                 redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_ai(session, engine, ai_client)
+                cmd_ai(session, engine, ai_client, terminology_store)
         elif choice == "f":
             if not _guard_ai(session, net, "词语修复"):
                 pass

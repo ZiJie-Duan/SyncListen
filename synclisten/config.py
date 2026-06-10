@@ -24,10 +24,27 @@ AI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 AI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 AI_MODEL = os.environ.get("AI_MODEL", "deepseek-chat")
 
-# ── 阿里云 DashScope（Paraformer 在线语音转写）─────────
-# 在线模式下用云端实时 STT，边录边传、低延迟、精度高。
+# ── 阿里云 DashScope（在线语音转写）──────────────────────
+# 在线模式下用云端 STT，精度高、支持中英混读与专名。
 # 申请方式见 README；密钥通过环境变量或 .env 配置。
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+
+# 在线 ASR 引擎：
+#   qwen       —— Qwen3-ASR-Flash（默认）。LLM 架构，中英混读强，可注入 context
+#                 （背景文本/专名/记忆）让模型在识别阶段就向术语靠拢；一次性识别，
+#                 按回车停止后约 1~3s 出结果（非流式）。
+#   paraformer —— Paraformer 实时识别。真流式、边录边传、零延迟感；作为保底/对比。
+ONLINE_ASR_ENGINE = os.environ.get("ONLINE_ASR_ENGINE", "qwen").strip().lower()
+
+# Qwen3-ASR-Flash：走 DashScope 的 OpenAI 兼容接口（复用 openai SDK），
+# 鉴权用 DASHSCOPE_API_KEY（与 AI 对话用的 OPENAI_API_KEY 分开）。
+QWEN_ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "qwen3-asr-flash")
+DASHSCOPE_BASE_URL = os.environ.get(
+    "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+# ASR context（背景文本）拼装时，已写入文稿最多截取的字符数（取最近窗口）。
+ASR_CONTEXT_DOC_LIMIT = int(os.environ.get("ASR_CONTEXT_DOC_LIMIT", "2000"))
+
 PARAFORMER_MODEL = os.environ.get("PARAFORMER_MODEL", "paraformer-realtime-v2")
 
 # ── 网络探测 ──────────────────────────────────────────
