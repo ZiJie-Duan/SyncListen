@@ -2,9 +2,12 @@
 """SenseVoice 语音转文字模块。"""
 
 import numpy as np
-from funasr import AutoModel
 
 from ..config import SENSEVOICE_MODEL, SENSEVOICE_DEVICE, SAMPLE_RATE
+
+# 注意：不在模块顶层 import funasr。
+# funasr 会连带加载 torch/sklearn 等，约需 5 秒，若放顶层会让程序
+# 在打印任何提示前黑屏干等。改为在模型加载时（已有提示）再 import。
 
 
 class SenseVoiceTranscriber:
@@ -22,10 +25,13 @@ class SenseVoiceTranscriber:
         if self._initialized:
             return
         print("🔄 正在加载 SenseVoice 模型…")
+        from funasr import AutoModel  # 延迟导入：约 5 秒，放在提示之后
+
         self.model = AutoModel(
             model=SENSEVOICE_MODEL,
             trust_remote_code=True,
             device=SENSEVOICE_DEVICE,
+            disable_update=True,  # 跳过 funasr 联网检查更新，省一次网络往返
         )
         self._initialized = True
         print("✅ 模型加载完成\n")

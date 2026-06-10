@@ -4,7 +4,8 @@
 SyncListen — 极简语音工作流
 一次运行 = 一个会话，退出不保存
 
-[回车] 写入模式  — 直接录音，AI润色后追加
+[回车] 写入模式  — 录音转写，忠实清理（去口癖语病、保留原话）后追加
+[S]    升华写入  — 录音转写，AI 深度润色（口语转书面、精炼有逻辑）后追加
 [E]    编辑模式  — 用 $EDITOR 直接编辑当前内容
 [A]    AI 指令   — 语音指令，AI处理当前内容
 [F]    词语修复  — AI 扫描全文修复语音转写错词（支持补充参考词与替换配对）
@@ -40,20 +41,50 @@ if sys.platform == "win32":
     import msvcrt
 
     def _getch_raw():
-        return msvcrt.getch().decode("utf-8", errors="ignore")
+        """读取单个按键。
+
+        - 普通字符返回单字符;
+        - 单独的 ESC 返回 "\\x1b"(长度 1);
+        - 方向键/功能键返回以 "\\x1b" 开头的多字符串(调用方据此区分并忽略)。
+        """
+        ch = msvcrt.getch()
+        if ch in (b"\x00", b"\xe0"):
+            # 功能键/方向键:再读一个字节,整体当作转义序列返回
+            nxt = msvcrt.getch()
+            return "\x1b[" + nxt.decode("latin-1", errors="ignore")
+        return ch.decode("utf-8", errors="ignore")
 else:
     import tty
     import termios
+    import select
 
     def _getch_raw():
+        """读取单个按键。
+
+        - 普通字符返回单字符;
+        - 单独的 ESC 返回 "\\x1b"(长度 1);
+        - 方向键/功能键返回完整转义序列如 "\\x1b[A"(长度 > 1)。
+
+        用 select 以极短超时区分「单独的 ESC」与「转义序列」,
+        避免读到单独 ESC 时阻塞等待下一次按键。
+        """
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
             ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                seq = ch
+                # 在 cbreak 模式下探测后续字节;单独 ESC 时无后续,循环立即结束
+                while select.select([fd], [], [], 0.05)[0]:
+                    seq += sys.stdin.read(1)
+                    # CSI/SS3 序列以字母或 '~' 结尾
+                    if seq[-1].isalpha() or seq[-1] == "~":
+                        break
+                return seq
+            return ch
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        return ch
 
 
 def _getch():
@@ -186,7 +217,7 @@ def redraw(session, transient="", hint="", input_buffer=None):
         hint = "↵ 确认 | ⌫ 删除 | ESC 跳过"
 
     # 底部操作栏
-    print("[↵]✍️  [E]📝  [A]🤖  [F]🔧  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
+    print("[↵]✍️  [S]✨  [E]📝  [A]🤖  [F]🔧  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
     if hint:
         print(hint)
 
@@ -251,16 +282,13 @@ def _read_input_line(session, transient=""):
         if ch in ("\r", "\n"):
             return buf
 
-        # ESC 取消（并吃掉可能的转义序列余下字符）
+        # 单独的 ESC 取消
         if ch == "\x1b":
-            while True:
-                try:
-                    nxt = _getch_raw()
-                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
-                        break
-                except (EOFError, KeyboardInterrupt):
-                    break
             return ""
+
+        # 方向键等转义序列：忽略
+        if ch.startswith("\x1b"):
+            continue
 
         # 退格 / DEL
         if ch in ("\x7f", "\b"):
@@ -269,13 +297,18 @@ def _read_input_line(session, transient=""):
             continue
 
         # 可打印字符（排除控制字符）
-        if ord(ch) >= 32:
+        if len(ch) == 1 and ord(ch) >= 32:
             buf += ch
             redraw(session, transient=transient, input_buffer=buf)
 
 
-def cmd_write(session, recorder, transcriber, ai_client):
-    """写入模式：录音 → 转写 → AI 润色 → 追加。词语修复请用 [F]。"""
+def cmd_write(session, recorder, transcriber, ai_client, strong=False):
+    """写入模式：录音 → 转写 → AI 润色 → 仅把本次新话追加到末尾（不动旧文本）。
+
+    Args:
+        strong: False=忠实清理（去口癖语病，保留原话）；True=升华（口语转书面、精炼有逻辑）。
+                两者都只作用于本次转写，整篇润色/改写请用 [A]，错词修复请用 [F]。
+    """
     redraw(session, hint="🔴 录音中… 按回车停止")
     recorder.start()
     _wait_for_enter()
@@ -292,9 +325,14 @@ def cmd_write(session, recorder, transcriber, ai_client):
         return
 
     if ai_client is not None:
-        redraw(session, transient=raw_text, hint="⏳ 润色中…")
+        if strong:
+            redraw(session, transient=raw_text, hint="⏳ 升华中…")
+            polish = ai_client.polish_text
+        else:
+            redraw(session, transient=raw_text, hint="⏳ 润色中…")
+            polish = ai_client.polish_text_light
         try:
-            text = ai_client.polish_text(raw_text)
+            text = polish(raw_text)
         except Exception:
             text = raw_text
     else:
@@ -306,7 +344,8 @@ def cmd_write(session, recorder, transcriber, ai_client):
     new_content += text
     session.commit(new_content)
     copy_to_clipboard(session.content)
-    redraw(session, hint=f"✅ 已写入 ({len(session.content)}字)")
+    label = "升华" if strong else "已写入"
+    redraw(session, hint=f"✅ {label} ({len(session.content)}字)")
 
 
 def cmd_ai(session, recorder, transcriber, ai_client):
@@ -555,22 +594,20 @@ def _read_terminology_input(store, prompt):
         if ch in ("\r", "\n"):
             return buf
 
+        # 单独的 ESC 取消
         if ch == "\x1b":
-            while True:
-                try:
-                    nxt = _getch_raw()
-                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
-                        break
-                except (EOFError, KeyboardInterrupt):
-                    break
             return None
+
+        # 方向键等转义序列：忽略
+        if ch.startswith("\x1b"):
+            continue
 
         if ch in ("\x7f", "\b"):
             buf = buf[:-1]
             _redraw_terminology(store, input_buffer=buf, input_prompt=prompt)
             continue
 
-        if ord(ch) >= 32:
+        if len(ch) == 1 and ord(ch) >= 32:
             buf += ch
             _redraw_terminology(store, input_buffer=buf, input_prompt=prompt)
 
@@ -591,16 +628,13 @@ def cmd_terminology(session, store):
         except (EOFError, KeyboardInterrupt):
             break
 
+        # 单独的 ESC 返回主界面
         if ch == "\x1b":
-            # 吃掉可能的转义序列
-            while True:
-                try:
-                    nxt = _getch_raw()
-                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
-                        break
-                except (EOFError, KeyboardInterrupt):
-                    break
             break
+
+        # 方向键等转义序列：忽略
+        if ch.startswith("\x1b"):
+            continue
 
         choice = ch.lower()
 
@@ -672,22 +706,19 @@ def main():
             _clear()
             break
 
-        # 忽略非预期的控制字符（如 Esc 序列开头）
-        if ch == "\x1b":
-            # 吃掉可能的 Esc 序列剩余字符
-            while True:
-                try:
-                    nxt = _getch()
-                    if nxt in ("\x00", "\xe0") or nxt.isalpha():
-                        break
-                except (EOFError, KeyboardInterrupt):
-                    break
+        # 主界面下 ESC 与方向键等转义序列：忽略
+        if ch.startswith("\x1b"):
             continue
 
         choice = ch.lower()
 
         if choice == "\r" or choice == "\n":
             cmd_write(session, recorder, transcriber, ai_client)
+        elif choice == "s":
+            if ai_client is None:
+                redraw(session, hint="⚠️ AI 未配置")
+            else:
+                cmd_write(session, recorder, transcriber, ai_client, strong=True)
         elif choice == "e":
             cmd_compose(session)
         elif choice == "a":
