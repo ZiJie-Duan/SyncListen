@@ -4,11 +4,16 @@
 SyncListen — 极简语音工作流
 一次运行 = 一个会话，退出不保存
 
-[回车] 写入模式  — 录音转写，忠实清理（去口癖语病、保留原话）后追加
-[S]    升华写入  — 录音转写，AI 深度润色（口语转书面、精炼有逻辑）后追加
+模式：
+  在线模式 — 云端 Paraformer 流式转写（边录边传）+ AI 全功能；启动不加载本地模型，最快。
+  离线模式 — 网络不可用时自动回退：本地 SenseVoice 转写，AI 功能停用、相关快捷键隐藏。
+  切换：启动探测一次；在线操作失败即探测确认是否断网；离线时每次操作探测是否恢复，自动来回切换。
+
+[回车] 写入模式  — 录音转写，忠实清理（去口癖语病、保留原话）后追加（离线时直接追加原始转写）
+[S]    升华写入  — 录音转写，AI 深度润色（口语转书面、精炼有逻辑）后追加（仅在线）
 [E]    编辑模式  — 用 $EDITOR 直接编辑当前内容
-[A]    AI 指令   — 语音指令，AI处理当前内容
-[F]    词语修复  — AI 扫描全文修复语音转写错词（支持补充参考词与替换配对）
+[A]    AI 指令   — 语音指令，AI处理当前内容（仅在线）
+[F]    词语修复  — AI 扫描全文修复语音转写错词（支持补充参考词与替换配对）（仅在线）
 [T]    易错词    — 管理持久化易错词表（增/删/查）
 [D]    清空      — 清空当前内容（可撤销）
 [Z]    撤销      — 回滚到上一版本
@@ -28,9 +33,15 @@ import textwrap
 import time
 
 from synclisten.core.recorder import AudioRecorder
-from synclisten.core.transcriber import SenseVoiceTranscriber
 from synclisten.core.ai_client import AIClient
 from synclisten.core.terminology import TerminologyStore
+from synclisten.core.network import NetworkManager
+# 注意：SenseVoiceTranscriber / CloudTranscriber 均按需延迟导入与实例化，
+# 见 TranscribeEngine——在线模式下不加载本地模型，启动更快。
+
+# 当前网络管理器（在 main() 中设置）。redraw 在未显式传 net 时回退到它，
+# 以便所有界面（撤销/复制/编辑等）离线时都能保持离线标记一致。
+_NET = None
 
 # ── 跨平台即时按键读取 ──────────────────────────────────
 def _is_tty():
@@ -183,15 +194,22 @@ def _fmt_content(text, width, max_lines=15):
     return lines
 
 
-def redraw(session, transient="", hint="", input_buffer=None):
+def redraw(session, transient="", hint="", input_buffer=None, net=None):
     """清屏并重绘分区：内容区 + 临时区 + 输入区 + 操作栏。
 
     Args:
         input_buffer: 如果为字符串（包括空串），则显示输入区，
                       None 则不显示输入区。
+        net: 可选 NetworkManager。离线时顶部显示离线标记、底部操作栏隐藏 AI 键。
     """
+    if net is None:
+        net = _NET
     _clear()
     w = _term_width()
+
+    # 离线标记：只有离线（异常态）才显示，在线保持干净
+    if net is not None and not net.is_online():
+        print("🔴 离线模式 · 本地转写 · AI 功能已停用".center(w))
 
     # 上半区：当前内容
     print("─" * w)
@@ -216,8 +234,11 @@ def redraw(session, transient="", hint="", input_buffer=None):
         print("─" * w)
         hint = "↵ 确认 | ⌫ 删除 | ESC 跳过"
 
-    # 底部操作栏
-    print("[↵]✍️  [S]✨  [E]📝  [A]🤖  [F]🔧  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
+    # 底部操作栏：离线时隐藏依赖网络的 AI 键（[S] 升华 / [A] AI / [F] 修复）
+    if net is not None and not net.is_online():
+        print("[↵]✍️  [E]📝  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
+    else:
+        print("[↵]✍️  [S]✨  [E]📝  [A]🤖  [F]🔧  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
     if hint:
         print(hint)
 
@@ -302,38 +323,130 @@ def _read_input_line(session, transient=""):
             redraw(session, transient=transient, input_buffer=buf)
 
 
-def cmd_write(session, recorder, transcriber, ai_client, strong=False):
-    """写入模式：录音 → 转写 → AI 润色 → 仅把本次新话追加到末尾（不动旧文本）。
+class TranscribeEngine:
+    """统一转写引擎：在线走云端流式 Paraformer，离线/失败回退本地 SenseVoice。
+
+    本地模型懒加载——在线模式从不实例化它，保证启动最快；首次掉线才加载（约 5s）。
+    云端识别器无本地模型，轻量，按需创建。
+    """
+
+    def __init__(self, recorder, net, cloud_available):
+        self.recorder = recorder
+        self.net = net
+        self.cloud_available = cloud_available  # 是否配置了 DASHSCOPE_API_KEY
+        self._local = None
+        self._cloud = None
+
+    def get_cloud(self):
+        from synclisten.core.cloud_transcriber import CloudTranscriber
+        if self._cloud is None:
+            self._cloud = CloudTranscriber()
+        return self._cloud
+
+    def get_local(self):
+        from synclisten.core.transcriber import SenseVoiceTranscriber
+        if self._local is None:
+            self._local = SenseVoiceTranscriber()
+        return self._local
+
+
+def _local_transcribe(session, engine, audio):
+    """本地 SenseVoice 转写（首次会触发约 5s 模型加载，带自身提示）。"""
+    redraw(session, net=engine.net, hint="🔄 本地转写中…")
+    local = engine.get_local()
+    text, _ = local.transcribe(audio)
+    return text
+
+
+def _capture(session, engine, recording_hint):
+    """录音并转写，返回 (text_or_None, note)。
+
+    在线：Paraformer 边录边传，停止即出结果；起步/中途断网则探测确认并回退本地。
+    离线：先探测是否恢复；未恢复则本地 SenseVoice 兜底。
+    过程中就地切换 engine.net 模式；note 携带模式切换提示（可空）。
+    """
+    net = engine.net
+    recorder = engine.recorder
+    note = ""
+
+    # 离线态：每次操作探测是否恢复（“仅操作时检测”）
+    if not net.is_online() and net.probe():
+        net.go_online()
+        note = "🟢 网络已恢复，切回在线"
+
+    use_cloud = net.is_online() and engine.cloud_available
+    cloud = None
+    on_frame = None
+    if use_cloud:
+        try:
+            cloud = engine.get_cloud()
+            cloud.begin()
+            on_frame = cloud.feed
+        except Exception:
+            # 起步即失败：探测确认是否真的断网
+            if not net.probe():
+                net.go_offline()
+                note = "⚠️ 网络不可用，已进入离线模式"
+            use_cloud = False
+            cloud = None
+            on_frame = None
+
+    redraw(session, net=net, hint=recording_hint)
+    recorder.start(on_frame=on_frame)
+    _wait_for_enter()
+    audio = recorder.stop()
+
+    if audio is None or len(audio) == 0:
+        if cloud is not None:
+            cloud.finalize()
+        return None, note
+
+    # 在线流式路径
+    if use_cloud and cloud is not None:
+        redraw(session, net=net, hint="⏳ 转写中…")
+        text = cloud.finalize()
+        if cloud.failed or not text:
+            # 云端中途失败：探测确认，用已录 buffer 本地兜底
+            if not net.probe():
+                net.go_offline()
+                note = "⚠️ 网络中断，已转为离线转写"
+            text = _local_transcribe(session, engine, audio)
+        return text, note
+
+    # 离线 / 无云端路径
+    return _local_transcribe(session, engine, audio), note
+
+
+def cmd_write(session, engine, ai_client, strong=False):
+    """写入模式：录音 → 转写 →（在线时）AI 润色 → 仅把本次新话追加到末尾（不动旧文本）。
 
     Args:
         strong: False=忠实清理（去口癖语病，保留原话）；True=升华（口语转书面、精炼有逻辑）。
                 两者都只作用于本次转写，整篇润色/改写请用 [A]，错词修复请用 [F]。
+                离线时跳过 AI，直接追加原始转写（纯转写模式）。
     """
-    redraw(session, hint="🔴 录音中… 按回车停止")
-    recorder.start()
-    _wait_for_enter()
-
-    redraw(session, hint="⏳ 转写中…")
-    audio = recorder.stop()
-    if audio is None or len(audio) == 0:
-        redraw(session, hint="⚠️ 未检测到音频")
+    net = engine.net
+    raw_text, note = _capture(session, engine, "🔴 录音中… 按回车停止")
+    if raw_text is None:
+        redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
         return
-
-    raw_text, _ = transcriber.transcribe(audio)
     if not raw_text:
-        redraw(session, hint="⚠️ 未识别到文字")
+        redraw(session, net=net, hint=note or "⚠️ 未识别到文字")
         return
 
-    if ai_client is not None:
+    if ai_client is not None and net.is_online():
         if strong:
-            redraw(session, transient=raw_text, hint="⏳ 升华中…")
+            redraw(session, net=net, transient=raw_text, hint="⏳ 升华中…")
             polish = ai_client.polish_text
         else:
-            redraw(session, transient=raw_text, hint="⏳ 润色中…")
+            redraw(session, net=net, transient=raw_text, hint="⏳ 润色中…")
             polish = ai_client.polish_text_light
         try:
             text = polish(raw_text)
         except Exception:
+            # AI 调用失败：探测确认是否断网，失败则保留原始转写
+            if not net.probe():
+                net.go_offline()
             text = raw_text
     else:
         text = raw_text
@@ -344,35 +457,41 @@ def cmd_write(session, recorder, transcriber, ai_client, strong=False):
     new_content += text
     session.commit(new_content)
     copy_to_clipboard(session.content)
-    label = "升华" if strong else "已写入"
-    redraw(session, hint=f"✅ {label} ({len(session.content)}字)")
+    if not net.is_online():
+        label = "已转写(离线)"
+    else:
+        label = "升华" if strong else "已写入"
+    suffix = f"  ·  {note}" if note else ""
+    redraw(session, net=net, hint=f"✅ {label} ({len(session.content)}字){suffix}")
 
 
-def cmd_ai(session, recorder, transcriber, ai_client):
-    """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史。"""
-    redraw(session, hint="🔴 说出指令… 按回车停止")
-    recorder.start()
-    _wait_for_enter()
-
-    redraw(session, hint="⏳ 转写中…")
-    audio = recorder.stop()
-    if audio is None or len(audio) == 0:
-        redraw(session, hint="⚠️ 未检测到音频")
+def cmd_ai(session, engine, ai_client):
+    """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史（仅在线）。"""
+    net = engine.net
+    instruction, note = _capture(session, engine, "🔴 说出指令… 按回车停止")
+    if instruction is None:
+        redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
         return
-
-    instruction, _ = transcriber.transcribe(audio)
     if not instruction:
-        redraw(session, hint="⚠️ 未识别到文字")
+        redraw(session, net=net, hint=note or "⚠️ 未识别到文字")
+        return
+    # 录音期间可能掉线 → AI 不可用
+    if not net.is_online():
+        redraw(session, net=net, hint="⚠️ 网络不可用，AI 指令已取消（离线）")
         return
 
-    redraw(session, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
+    redraw(session, net=net, transient=f"📋 {instruction}", hint="⏳ AI 处理中…")
     try:
         result = ai_client.process_document(session.content, instruction)
         session.commit(result)
         copy_to_clipboard(session.content)
-        redraw(session, hint="✅ AI 已覆盖")
+        redraw(session, net=net, hint="✅ AI 已覆盖")
     except Exception as e:
-        redraw(session, hint=f"❌ {e}")
+        if not net.probe():
+            net.go_offline()
+            redraw(session, net=net, hint="⚠️ 网络中断，已转离线，AI 指令取消")
+        else:
+            redraw(session, net=net, hint=f"❌ {e}")
 
 
 def _edit_dir():
@@ -680,24 +799,56 @@ def cmd_terminology(session, store):
     redraw(session)
 
 
+def _guard_ai(session, net, feature):
+    """AI 功能入口守卫。返回 True 表示当前在线、可继续。
+
+    离线时探测是否恢复：恢复则切回在线并提示重试；仍断网则提示该功能离线不可用。
+    两种情况都返回 False（恢复后让用户再按一次，操作栏也会先刷新出 AI 键）。
+    """
+    if net.is_online():
+        return True
+    if net.probe():
+        net.go_online()
+        redraw(session, net=net, hint=f"🟢 网络已恢复，请重试{feature}")
+    else:
+        redraw(session, net=net, hint=f"⚠️ 离线模式不支持{feature}")
+    return False
+
+
 def main():
+    global _NET
     session = Session()
     terminology_store = TerminologyStore()
 
-    print("🔄 加载 SenseVoice…")
-    transcriber = SenseVoiceTranscriber()
+    net = NetworkManager()
+    _NET = net
     recorder = AudioRecorder()
 
+    print("🌐 检测网络…")
+    if net.probe():
+        net.go_online()
+    else:
+        net.go_offline()
+
+    from synclisten.config import DASHSCOPE_API_KEY
+    cloud_available = bool(DASHSCOPE_API_KEY)
+    engine = TranscribeEngine(recorder, net, cloud_available)
+
     ai_client = None
-    try:
-        ai_client = AIClient()
-        print("✅ AI 就绪")
-    except ValueError as e:
-        print(f"⚠️  AI 未配置: {e}")
-        print("   A 模式不可用")
+    if net.is_online():
+        try:
+            ai_client = AIClient()
+        except ValueError as e:
+            print(f"⚠️  AI 未配置: {e}（[S]/[A]/[F] 不可用）")
+        if cloud_available:
+            print("✅ 在线模式就绪（Paraformer 云端流式转写，启动未加载本地模型）")
+        else:
+            print("⚠️  未配置 DASHSCOPE_API_KEY：语音转写将使用本地 SenseVoice（首次约 5s 加载）")
+    else:
+        print("🔴 网络不可用，进入离线模式（本地 SenseVoice 转写，AI 已停用）")
 
     time.sleep(0.5)
-    redraw(session)
+    redraw(session, net=net)
 
     while True:
         try:
@@ -713,22 +864,28 @@ def main():
         choice = ch.lower()
 
         if choice == "\r" or choice == "\n":
-            cmd_write(session, recorder, transcriber, ai_client)
+            cmd_write(session, engine, ai_client)
         elif choice == "s":
-            if ai_client is None:
-                redraw(session, hint="⚠️ AI 未配置")
+            if not _guard_ai(session, net, "升华"):
+                pass
+            elif ai_client is None:
+                redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_write(session, recorder, transcriber, ai_client, strong=True)
+                cmd_write(session, engine, ai_client, strong=True)
         elif choice == "e":
             cmd_compose(session)
         elif choice == "a":
-            if ai_client is None:
-                redraw(session, hint="⚠️ AI 未配置")
+            if not _guard_ai(session, net, "AI 指令"):
+                pass
+            elif ai_client is None:
+                redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_ai(session, recorder, transcriber, ai_client)
+                cmd_ai(session, engine, ai_client)
         elif choice == "f":
-            if ai_client is None:
-                redraw(session, hint="⚠️ AI 未配置")
+            if not _guard_ai(session, net, "词语修复"):
+                pass
+            elif ai_client is None:
+                redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
                 cmd_repair(session, ai_client, terminology_store)
         elif choice == "t":
@@ -745,7 +902,7 @@ def main():
             _clear()
             break
         else:
-            redraw(session, hint=f"? 未知按键: {repr(ch)}")
+            redraw(session, net=net, hint=f"? 未知按键: {repr(ch)}")
 
 
 if __name__ == "__main__":

@@ -186,6 +186,8 @@ chmod +x ~/bin/sway-synclisten
 | `OPENAI_API_KEY` | optional | — | If unset, `[A]` and `[F]` are unavailable; Write mode falls back to raw transcription with no AI polish |
 | `OPENAI_BASE_URL` | optional | `https://api.deepseek.com/v1` | Any OpenAI-compatible endpoint |
 | `AI_MODEL` | optional | `deepseek-chat` | Model name passed to the AI endpoint |
+| `DASHSCOPE_API_KEY` | optional | — | Alibaba Cloud key for online streaming transcription (Paraformer). If unset, transcription always uses the local SenseVoice model |
+| `PARAFORMER_MODEL` | optional | `paraformer-realtime-v2` | DashScope real-time ASR model used for online transcription |
 | `EDITOR` | optional | `vi` | Editor binary used by `[E]`. Set to `env NVIM_APPNAME=synclisten-nvim nvim` for the editor enhancement |
 | `VISUAL` | optional | — | Honored as a fallback if `EDITOR` is unset |
 | `XDG_STATE_HOME` | optional | `~/.local/state` | Root of the edit-draft directory |
@@ -193,6 +195,22 @@ chmod +x ~/bin/sway-synclisten
 | `WAYLAND_DISPLAY` / `DISPLAY` | auto | — | Detected at runtime to choose `wl-copy` vs `xclip` |
 
 The `.env` file at the repo root is loaded via `python-dotenv` and is the recommended place for `OPENAI_*` and `AI_MODEL`.
+
+## Online / Offline modes
+
+SyncListen probes the network once at startup and adapts automatically:
+
+- **Online** — cloud streaming transcription (Alibaba Cloud Paraformer, audio is streamed while you speak for minimal latency) plus all AI features. The local SenseVoice model is **not** loaded, so startup is fast.
+- **Offline** — entered when the network is unreachable. A `🔴 离线模式` banner appears, AI hotkeys (`[S]`/`[A]`/`[F]`) are hidden, and transcription falls back to the local SenseVoice model (lazy-loaded on first use, ~5 s once).
+
+Switching is automatic: an online operation that fails triggers a probe to confirm the drop; while offline, every action re-probes so it switches back the moment the network recovers. Install the cloud SDK with `pip install dashscope`.
+
+**Getting a DashScope (Paraformer) API key:**
+1. Sign in at the [Alibaba Cloud Model Studio / DashScope console](https://dashscope.console.aliyun.com/) (百炼).
+2. Activate the speech (语音) service and create an API Key under **API-KEY 管理**.
+3. Put it in `.env`: `echo 'DASHSCOPE_API_KEY=sk-...' >> .env`.
+
+Without `DASHSCOPE_API_KEY`, the app stays usable but transcription always uses the local model.
 
 ## FAQ
 
