@@ -140,7 +140,7 @@ ASR 上下文三件套之一。给模型一个"我最近在聊什么领域/话�
 | 名称 | 含义 | 默认 |
 |---|---|---|
 | `QWEN_ASR_MODEL` | Qwen ASR 模型名 | `qwen3-asr-flash` |
-| `MEMORY_FILE` | 长期记忆 JSON 路径 | 仓库内数据目录 |
+| `MEMORY_FILE` | 长期记忆 JSON 路径 | `~/.config/synclisten/memory.json`（与 terminology.json 一致，不入库） |
 | `MEMORY_RETENTION_DAYS` | 存储保留天数 | 30 |
 | `MEMORY_REFERENCE_DAYS` | 生成参考天数 | 3 |
 | `MEMORY_DAY_CHAR_LIMIT` | 每天记忆字数上限 | 500 |

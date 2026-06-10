@@ -29,9 +29,10 @@ from ..config import (
 # context 各部分的标签前缀。既用于拼装注入文本（见 main._build_asr_context），
 # 也作为“回吐”判别的指纹：这些是我们注入的管理性字样，正常语音几乎不可能逐字
 # 念出，可据此把“模型回吐 context”与“用户真的提到某个术语”区分开。
+CONTEXT_MEMORY_LABEL = "近期记忆："
 CONTEXT_TERMS_LABEL = "热词/专有名词："
 CONTEXT_DOC_LABEL = "已有上下文："
-_CONTEXT_LABELS = (CONTEXT_TERMS_LABEL, CONTEXT_DOC_LABEL)
+_CONTEXT_LABELS = (CONTEXT_MEMORY_LABEL, CONTEXT_TERMS_LABEL, CONTEXT_DOC_LABEL)
 
 
 def _norm(s):

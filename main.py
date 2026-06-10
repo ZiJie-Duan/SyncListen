@@ -16,7 +16,8 @@ SyncListen — 极简语音工作流
 [A]    AI 指令   — 语音指令，AI处理当前内容（仅在线）
 [F]    词语修复  — AI 扫描全文修复语音转写错词（支持补充参考词与替换配对）（仅在线）
 [T]    易错词    — 管理持久化易错词表（增/删/查）
-[D]    清空      — 清空当前内容（可撤销）
+[M]    记忆      — 查看/编辑/清空长期记忆（连贯记忆，作为识别语境注入，持久化跨重启）
+[D]    清空      — 清空当前内容（可撤销）；同时把文稿快照交给长期记忆归档（任务切换点）
 [Z]    撤销      — 回滚到上一版本
 [X]    重做      — 前进到下一版本
 [C]    复制      — 手动复制到剪贴板
@@ -235,11 +236,12 @@ def redraw(session, transient="", hint="", input_buffer=None, net=None):
         print("─" * w)
         hint = "↵ 确认 | ⌫ 删除 | ESC 跳过"
 
-    # 底部操作栏：离线时隐藏依赖网络的 AI 键（[S] 升华 / [A] AI / [F] 修复）
+    # 底部操作栏：离线时隐藏依赖网络的 AI 键（[S] 升华 / [A] AI / [F] 修复）。
+    # [M] 记忆模式本身（查看/编辑/清空）是本地操作，离线也可用，故两栏都保留。
     if net is not None and not net.is_online():
-        print("[↵]✍️  [E]📝  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
+        print("[↵]✍️  [E]📝  [T]📒  [M]📓  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
     else:
-        print("[↵]✍️  [S]✨  [E]📝  [A]🤖  [F]🔧  [T]📒  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
+        print("[↵]✍️  [S]✨  [E]📝  [A]🤖  [F]🔧  [T]📒  [M]📓  [D]🗑  [Z]↩️  [X]↪️  [C]📋  [Q]👋")
     if hint:
         print(hint)
 
@@ -375,16 +377,23 @@ def _local_transcribe(session, engine, audio):
     return text
 
 
-def _build_asr_context(session, terminology_store):
+def _build_asr_context(session, terminology_store, memory_store=None):
     """拼装 ASR 背景文本（context），提升中英混读与专名识别。
 
-    上下文三件套：① 今天的长期记忆（块二接入，暂缺）② 已写入文稿（过长截最近窗口）
-    ③ 易错词表 [T]。仅 Qwen 引擎使用；Paraformer 不支持 context，忽略本值。
+    上下文三件套：① 今天的长期记忆 ② 易错词表 [T] ③ 已写入文稿（过长截最近窗口）。
+    仅 Qwen 引擎使用；Paraformer 不支持 context，忽略本值。
     """
     from synclisten.config import ASR_CONTEXT_DOC_LIMIT
     # 标签前缀与 qwen_asr 共用：既注入，也作为回吐判别的指纹（见 _is_context_echo）。
-    from synclisten.core.qwen_asr import CONTEXT_TERMS_LABEL, CONTEXT_DOC_LABEL
+    from synclisten.core.qwen_asr import (
+        CONTEXT_MEMORY_LABEL,
+        CONTEXT_TERMS_LABEL,
+        CONTEXT_DOC_LABEL,
+    )
     parts = []
+    mem = memory_store.today_text() if memory_store is not None else ""
+    if mem:
+        parts.append(CONTEXT_MEMORY_LABEL + mem)
     terms = list(terminology_store.list()) if terminology_store is not None else []
     if terms:
         parts.append(CONTEXT_TERMS_LABEL + "、".join(terms))
@@ -482,17 +491,18 @@ def _capture(session, engine, recording_hint, context=""):
     return _local_transcribe(session, engine, audio), note
 
 
-def cmd_write(session, engine, ai_client, terminology_store=None, strong=False):
+def cmd_write(session, engine, ai_client, terminology_store=None, memory_store=None, strong=False):
     """写入模式：录音 → 转写 →（在线时）AI 润色 → 仅把本次新话追加到末尾（不动旧文本）。
 
     Args:
         terminology_store: 易错词表，用于拼装 ASR context（Qwen 引擎专名提示）。
+        memory_store: 长期记忆，今天这条拼入 ASR context（语境画像）。
         strong: False=忠实清理（去口癖语病，保留原话）；True=升华（口语转书面、精炼有逻辑）。
                 两者都只作用于本次转写，整篇润色/改写请用 [A]，错词修复请用 [F]。
                 离线时跳过 AI，直接追加原始转写（纯转写模式）。
     """
     net = engine.net
-    context = _build_asr_context(session, terminology_store)
+    context = _build_asr_context(session, terminology_store, memory_store)
     raw_text, note = _capture(session, engine, "🔴 录音中… 按回车停止", context=context)
     if raw_text is None:
         redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
@@ -532,10 +542,10 @@ def cmd_write(session, engine, ai_client, terminology_store=None, strong=False):
     redraw(session, net=net, hint=f"✅ {label} ({len(session.content)}字){suffix}")
 
 
-def cmd_ai(session, engine, ai_client, terminology_store=None):
+def cmd_ai(session, engine, ai_client, terminology_store=None, memory_store=None):
     """AI 指令模式：录音为指令 → AI 处理 → 覆盖内容，压入历史（仅在线）。"""
     net = engine.net
-    context = _build_asr_context(session, terminology_store)
+    context = _build_asr_context(session, terminology_store, memory_store)
     instruction, note = _capture(session, engine, "🔴 说出指令… 按回车停止", context=context)
     if instruction is None:
         redraw(session, net=net, hint=note or "⚠️ 未检测到音频")
@@ -715,8 +725,61 @@ def cmd_redo(session):
         redraw(session, hint="⚠️ 没有更新版本")
 
 
-def cmd_clear(session):
-    """清空当前内容，压入历史（可撤销）。"""
+def _flash_memory_saved():
+    """记忆后台更新完成时由更新线程回调：在当前行原地闪烁“💾 记忆更新”两下约 1 秒。
+
+    主循环此刻阻塞在 _getch（不向屏幕输出），故只有本线程在写，不会与 redraw 抢输出；
+    用 \\r + 清行原地闪烁，不扰动上方内容；用户下次按键触发 redraw 会整屏重绘清掉残留。
+    """
+    if not _is_tty():
+        return
+    msg = "💾 记忆更新"
+    try:
+        for _ in range(2):
+            sys.stdout.write("\r\033[2K" + msg)
+            sys.stdout.flush()
+            time.sleep(0.25)
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+
+def _maybe_update_memory(memory_store, session, terminology_store, ai_client, net):
+    """一次 AI 功能后调用：累计满 N 次则后台更新长期记忆（条件 A）。
+
+    需在线且 AI 可用（记忆更新本身是 LLM 调用）。离线时不计数、不更新。
+    """
+    if memory_store is None or ai_client is None or not net.is_online():
+        return
+    if memory_store.bump_counter():
+        terms = list(terminology_store.list()) if terminology_store is not None else []
+        memory_store.update_async(
+            session.content, terms, ai_client, on_done=_flash_memory_saved, force=False
+        )
+
+
+def cmd_clear(session, memory_store=None, terminology_store=None, ai_client=None, net=None):
+    """清空当前内容，压入历史（可撤销）。
+
+    [D] 是用户“任务切换”的天然快照点（条件 B）：清空前先把当前文稿快照交给记忆做一次
+    更新存档（先抓取文稿 → 后台更新记忆 → 再清空），避免任务内容随清空而流失。
+    记忆线程拿的是文稿副本，故立即清空不影响其归档；且清空本身可 [Z] 撤销。
+    """
+    doc = session.content
+    if (
+        memory_store is not None
+        and ai_client is not None
+        and net is not None
+        and net.is_online()
+        and doc.strip()
+    ):
+        terms = list(terminology_store.list()) if terminology_store is not None else []
+        memory_store.update_async(
+            doc, terms, ai_client, on_done=_flash_memory_saved, force=True
+        )
+        memory_store.reset_counter()
     session.commit("")
     redraw(session, hint="🗑 已清空")
 
@@ -867,6 +930,116 @@ def cmd_terminology(session, store):
     redraw(session)
 
 
+def _redraw_memory(memory_store, hint="", input_buffer=None, input_prompt=""):
+    """渲染长期记忆界面：今天的记忆 + 最近几天，底部菜单/确认区。"""
+    _clear()
+    w = _term_width()
+    today = memory_store.today_items()
+    recent = memory_store.recent_days(exclude_today=True)
+
+    print("─" * w)
+    today_chars = sum(len(x) for x in today)
+    print(f"📓 长期记忆 · 今天（{today_chars} 字）")
+    if not today:
+        print("  (今天还没有记忆)")
+    else:
+        for it in today:
+            for line in _wrap_text("• " + it, w):
+                print(line)
+    if recent:
+        print()
+        print("最近几天（仅供生成参考，喂给识别的只有今天这条）：")
+        for d in recent:
+            head = f"  {d['date']}："
+            body = "；".join(d["items"]) if d["items"] else "（空）"
+            for i, line in enumerate(_wrap_text(head + body, w)):
+                print(line)
+    print("─" * w)
+
+    if input_buffer is not None:
+        avail = max(1, w - len(input_prompt) - 1)
+        visible = input_buffer[-avail:] if len(input_buffer) > avail else input_buffer
+        print(f"{input_prompt}{visible}▌")
+        print("─" * w)
+        print("↵ 确认 | ESC 取消")
+    else:
+        print("[E]编辑今天  [D]清空全部  [ESC]返回")
+
+    if hint:
+        print(hint)
+
+
+def _edit_memory_today(memory_store):
+    """用 $EDITOR 编辑今天的记忆（每行一条），保存后写回。返回提示串。"""
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    edit_dir = _edit_dir()
+    path = os.path.join(edit_dir, f"memory-{int(time.time() * 1000)}-{os.getpid()}.txt")
+    header = "# 每行一条记忆，空行忽略；以 # 开头的行为注释会被忽略。\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(memory_store.today_items()))
+
+    try:
+        rc = subprocess.run(shlex.split(editor) + [path]).returncode
+    except FileNotFoundError:
+        return f"❌ 找不到编辑器：{editor}"
+    if rc != 0:
+        return f"⚠️ 编辑器异常退出 (rc={rc})  草稿保留：{path}"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        return f"❌ 读取草稿失败：{e}  路径：{path}"
+
+    items = [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+    memory_store.set_today(items)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return f"✅ 已更新今天的记忆（{len(items)} 条）"
+
+
+def cmd_memory(session, memory_store):
+    """[M] 记忆模式：查看 / 编辑今天 / 清空全部。按 ESC 返回主界面。"""
+    hint = ""
+    while True:
+        _redraw_memory(memory_store, hint=hint)
+        hint = ""
+
+        if not _is_tty():
+            break
+        try:
+            ch = _getch_raw()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if ch == "\x1b":  # 单独 ESC 返回
+            break
+        if ch.startswith("\x1b"):  # 方向键等忽略
+            continue
+
+        choice = ch.lower()
+        if choice == "e":
+            hint = _edit_memory_today(memory_store)
+        elif choice == "d":
+            # 清空前确认；clear() 内部会先写 .bak 存档（优先可恢复）
+            _redraw_memory(memory_store, input_buffer="", input_prompt="⚠️ 清空全部记忆？输入 y 确认：")
+            try:
+                confirm = _getch_raw()
+            except (EOFError, KeyboardInterrupt):
+                confirm = ""
+            if confirm.lower() == "y":
+                memory_store.clear()
+                hint = "🗑 已清空长期记忆（旧记忆已存档 .bak）"
+            else:
+                hint = "⚠️ 已取消"
+        elif choice in ("q", "m"):
+            break
+
+    redraw(session)
+
+
 def _guard_ai(session, net, feature):
     """AI 功能入口守卫。返回 True 表示当前在线、可继续。
 
@@ -887,6 +1060,8 @@ def main():
     global _NET
     session = Session()
     terminology_store = TerminologyStore()
+    from synclisten.core.memory import MemoryStore
+    memory_store = MemoryStore()  # 持久化、跨重启、全局一份
 
     net = NetworkManager()
     _NET = net
@@ -935,14 +1110,16 @@ def main():
         choice = ch.lower()
 
         if choice == "\r" or choice == "\n":
-            cmd_write(session, engine, ai_client, terminology_store)
+            cmd_write(session, engine, ai_client, terminology_store, memory_store)
+            _maybe_update_memory(memory_store, session, terminology_store, ai_client, net)
         elif choice == "s":
             if not _guard_ai(session, net, "升华"):
                 pass
             elif ai_client is None:
                 redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_write(session, engine, ai_client, terminology_store, strong=True)
+                cmd_write(session, engine, ai_client, terminology_store, memory_store, strong=True)
+                _maybe_update_memory(memory_store, session, terminology_store, ai_client, net)
         elif choice == "e":
             cmd_compose(session)
         elif choice == "a":
@@ -951,7 +1128,8 @@ def main():
             elif ai_client is None:
                 redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
-                cmd_ai(session, engine, ai_client, terminology_store)
+                cmd_ai(session, engine, ai_client, terminology_store, memory_store)
+                _maybe_update_memory(memory_store, session, terminology_store, ai_client, net)
         elif choice == "f":
             if not _guard_ai(session, net, "词语修复"):
                 pass
@@ -959,17 +1137,24 @@ def main():
                 redraw(session, net=net, hint="⚠️ AI 未配置")
             else:
                 cmd_repair(session, ai_client, terminology_store)
+                _maybe_update_memory(memory_store, session, terminology_store, ai_client, net)
         elif choice == "t":
             cmd_terminology(session, terminology_store)
+        elif choice == "m":
+            cmd_memory(session, memory_store)
         elif choice == "z":
             cmd_undo(session)
         elif choice == "x":
             cmd_redo(session)
         elif choice == "d":
-            cmd_clear(session)
+            cmd_clear(session, memory_store, terminology_store, ai_client, net)
         elif choice == "c":
             cmd_copy(session)
         elif choice == "q":
+            # 退出前等未完成的记忆更新落盘（优先可恢复，别丢记忆）
+            if memory_store.wait_pending(timeout=0.0):
+                redraw(session, net=net, hint="💾 正在保存记忆…")
+                memory_store.wait_pending(timeout=10.0)
             _clear()
             break
         else:

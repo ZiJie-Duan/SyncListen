@@ -55,6 +55,17 @@ NETWORK_PROBE_HOSTS = [
 ]
 NETWORK_PROBE_TIMEOUT = 2.0
 
+# ── 长期记忆（连贯记忆 / 衰减记忆）────────────────────────
+# 一份持久化、按天分片的滚动记忆，描述用户最近在做/聊什么，作为 ASR 上下文三件套
+# 之一注入，提升专名与语境识别。短期专注 + 逐渐遗忘：生成只看最近几天，存储滚动保留。
+MEMORY_FILE = os.environ.get(
+    "MEMORY_FILE", os.path.expanduser("~/.config/synclisten/memory.json")
+)
+MEMORY_RETENTION_DAYS = int(os.environ.get("MEMORY_RETENTION_DAYS", "30"))  # 存储保留窗口
+MEMORY_REFERENCE_DAYS = int(os.environ.get("MEMORY_REFERENCE_DAYS", "3"))   # 生成参考窗口
+MEMORY_DAY_CHAR_LIMIT = int(os.environ.get("MEMORY_DAY_CHAR_LIMIT", "500")) # 每天记忆字数上限
+MEMORY_AI_TRIGGER_COUNT = int(os.environ.get("MEMORY_AI_TRIGGER_COUNT", "5"))  # 触发更新的 AI 次数
+
 # ── 应用配置 ──────────────────────────────────────────
 APP_NAME = "SyncListen"
 DOCUMENTS_DIR = os.path.expanduser("~/.config/synclisten/documents")

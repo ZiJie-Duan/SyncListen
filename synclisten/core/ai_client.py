@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """AI 大模型客户端，支持 OpenAI / DeepSeek 等兼容 API。"""
 
+import json
 import os
+import re
 from openai import OpenAI
 
 from ..config import AI_API_KEY, AI_BASE_URL, AI_MODEL
@@ -239,3 +241,81 @@ class AIClient:
 
         user_prompt = f"请修复以下文本中的语音转写错词：\n\n{text}"
         return self.chat(system_prompt, user_prompt, temperature=0.2)
+
+    def update_memory(self, recent_days, today_items, current_doc, terms, char_limit=500):
+        """更新“长期记忆”今天这条：近因加权 + 选择性遗忘 + 压缩重写。
+
+        产出一份描述用户最近在做什么 / 聊什么领域的零散短句列表，作为语音识别的
+        语境画像。只输出今天这条的 items。
+
+        Args:
+            recent_days: [{"date","items":[...]}, ...] 最近几天的记忆（升序，不含今天）。
+            today_items: 今天已有的记忆条目（本次在其基础上重写，避免丢失当天积累）。
+            current_doc: 当前文稿（用户最近实际写下的内容）。
+            terms: 易错词 / 专有名词表。
+            char_limit: 今天记忆的总字数上限。
+
+        Returns:
+            list[str]：今天的记忆条目。解析失败返回 []（调用方据此跳过本次更新）。
+        """
+        system_prompt = (
+            "你在维护一份「长期记忆」，用来描述用户最近在做什么、聊什么领域/话题，"
+            "它会作为语音识别的语境提示，帮助更准地识别专有名词与上下文。\n"
+            "现在请你重写【今天】这一条记忆，规则：\n"
+            "1. 近因加权：越靠近今天的信息越重要；当前文稿与今天已有记忆优先于更早几天。\n"
+            "2. 选择性遗忘：删掉过时、已不相关或不重要的条目，不必保留全部历史。\n"
+            "3. 压缩重写：用零散、简短的一句话条目记录“用户在做/聊什么”，不要长篇大论。\n"
+            f"4. 严格控制：今天所有条目加起来不超过 {char_limit} 个字。\n"
+            "5. 只输出一个 JSON 数组（字符串数组），不要任何解释、Markdown 或多余文字。\n"
+            "示例输出：[\"用户在写语音转写 CLI SyncListen\", \"在讨论 Qwen3-ASR-Flash 的 context 注入\"]"
+        )
+
+        def _fmt_days(days):
+            if not days:
+                return "（无）"
+            lines = []
+            for d in days:
+                items = "；".join(d.get("items", []))
+                lines.append(f"- {d.get('date','')}：{items}")
+            return "\n".join(lines)
+
+        doc = (current_doc or "").strip()
+        if len(doc) > 4000:  # 文稿过长只取最近窗口，避免压垮上下文
+            doc = doc[-4000:]
+        user_prompt = (
+            f"【最近几天的记忆（仅供参考，做近因加权与遗忘）】\n{_fmt_days(recent_days)}\n\n"
+            f"【今天已有的记忆】\n{'；'.join(today_items) if today_items else '（无）'}\n\n"
+            f"【当前文稿】\n{doc if doc else '（空）'}\n\n"
+            f"【易错词/专有名词】\n{('、'.join(terms)) if terms else '（无）'}\n\n"
+            "请输出今天的记忆（JSON 字符串数组）："
+        )
+
+        raw = self.chat(system_prompt, user_prompt, temperature=0.3)
+        return self._parse_memory_items(raw, char_limit)
+
+    @staticmethod
+    def _parse_memory_items(raw, char_limit):
+        """把模型输出解析成字符串列表：优先 JSON 数组，回退按行解析。"""
+        if not raw:
+            return []
+        text = raw.strip()
+        # 去掉可能的 ```json ... ``` 围栏
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+        items = None
+        # 优先解析 JSON 数组（可能前后有杂物，截取第一个 [...] ）
+        m = re.search(r"\[.*\]", text, flags=re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, list):
+                    items = [str(x).strip() for x in parsed if str(x).strip()]
+            except (json.JSONDecodeError, ValueError):
+                items = None
+        if items is None:
+            # 回退：按行，去掉项目符号 / 引号
+            items = []
+            for line in text.splitlines():
+                line = line.strip().lstrip("-*•0123456789.、) ").strip().strip('"').strip("，,")
+                if line:
+                    items.append(line)
+        return items
