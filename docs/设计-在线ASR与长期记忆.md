@@ -1,6 +1,7 @@
 # SyncListen 设计文档：在线 ASR 引擎升级 + 长期记忆系统
 
 > 状态：设计已锁定，待实现。
+> 2026-09-01 更新：易错词表 [T] 与词语修复 [F] 已整体移除，ASR 上下文由“三件套”改为“两件套”（今日记忆 + 已写文稿）；在线转写默认改为 Qwen3-ASR-Flash-Realtime 真流式（`synclisten/core/qwen_realtime.py`，边说边出字、服务端 VAD 切句、corpus 注入 context），实时会话失败时热切换到约 5 秒分段转写（`synclisten/core/live_asr.py`，只补转尚无定稿的音频）。本文档保留为历史设计记录。
 > 作者：Zijie / Claude
 > 日期：2026-06-10
 

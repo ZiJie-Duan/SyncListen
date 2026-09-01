@@ -203,46 +203,7 @@ class AIClient:
         user_prompt = f"请润色以下内容：\n\n{raw_text} 输出："
         return self.chat(system_prompt, user_prompt, temperature=0.3)
 
-    def repair_words(self, text, terms=None, pairs=None):
-        """词语修复：扫描文本中可能因语音转写出错的词，按用户提供的参考词与替换配对修复。
-
-        Args:
-            text: 待修复的文本
-            terms: 可选，正确词参考列表（用户希望文中正确出现的词）
-            pairs: 可选，替换配对列表 [(错词, 正确词), ...]，错词允许是用户凭印象写的近似版本
-
-        Returns:
-            修复后的文本
-        """
-        system_prompt = (
-            "你是一名语音转写错误修复助手。用户提供的文本是语音转写结果，"
-            "可能存在词汇识别错误（同音字、近音字、专有名词被识别成普通词等）。\n"
-            "请扫描全文，将可疑的错误词汇替换为正确词汇。\n"
-            "原则：\n"
-            "1. 仅修改可疑的错词，不做润色、不重写句子\n"
-            "2. 保留原文的句式、标点、段落、空白结构\n"
-            "3. 拿不准的词不要改，避免引入新错误\n"
-            "4. 不要添加任何解释或前后缀，只输出修复后的文本"
-        )
-        if terms:
-            system_prompt += (
-                f"\n\n以下是用户提供的正确词参考表，请优先把文本中近似但拼写错误的词"
-                f"替换成这些正确版本：\n{', '.join(terms)}"
-            )
-        if pairs:
-            pair_lines = "\n".join(f"- {w} → {c}" for w, c in pairs)
-            system_prompt += (
-                "\n\n以下是用户明确指定的替换配对（错词 → 正确词）。"
-                "注意：用户给出的『错词』可能本身只是凭印象写出的近似版本，"
-                "未必和文本中的错词一字不差。请按读音或字形在文本中找到与之最接近的词，"
-                "统一替换为对应的『正确词』；若文中找不到任何接近的目标，则跳过该条配对：\n"
-                f"{pair_lines}"
-            )
-
-        user_prompt = f"请修复以下文本中的语音转写错词：\n\n{text}"
-        return self.chat(system_prompt, user_prompt, temperature=0.2)
-
-    def update_memory(self, recent_days, today_items, current_doc, terms, char_limit=500):
+    def update_memory(self, recent_days, today_items, current_doc, char_limit=500):
         """更新“长期记忆”今天这条：近因加权 + 选择性遗忘 + 压缩重写。
 
         产出一份描述用户最近在做什么 / 聊什么领域的零散短句列表，作为语音识别的
@@ -252,7 +213,6 @@ class AIClient:
             recent_days: [{"date","items":[...]}, ...] 最近几天的记忆（升序，不含今天）。
             today_items: 今天已有的记忆条目（本次在其基础上重写，避免丢失当天积累）。
             current_doc: 当前文稿（用户最近实际写下的内容）。
-            terms: 易错词 / 专有名词表。
             char_limit: 今天记忆的总字数上限。
 
         Returns:
@@ -286,7 +246,6 @@ class AIClient:
             f"【最近几天的记忆（仅供参考，做近因加权与遗忘）】\n{_fmt_days(recent_days)}\n\n"
             f"【今天已有的记忆】\n{'；'.join(today_items) if today_items else '（无）'}\n\n"
             f"【当前文稿】\n{doc if doc else '（空）'}\n\n"
-            f"【易错词/专有名词】\n{('、'.join(terms)) if terms else '（无）'}\n\n"
             "请输出今天的记忆（JSON 字符串数组）："
         )
 

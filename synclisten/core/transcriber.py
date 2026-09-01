@@ -1,31 +1,36 @@
 # -*- coding: utf-8 -*-
 """SenseVoice 语音转文字模块。"""
 
-import numpy as np
+import threading
 
 from ..config import SENSEVOICE_MODEL, SENSEVOICE_DEVICE, SAMPLE_RATE
 
 # 注意：不在模块顶层 import funasr。
 # funasr 会连带加载 torch/sklearn 等，约需 5 秒，若放顶层会让程序
-# 在打印任何提示前黑屏干等。改为在模型加载时（已有提示）再 import。
+# 在打印任何提示前黑屏干等。改为首次实例化时（调用方已显示提示）再 import。
 
 
 class SenseVoiceTranscriber:
-    """基于 SenseVoice 的语音识别器（单例）。"""
+    """基于 SenseVoice 的语音识别器（进程内单例，线程安全）。
+
+    可能从分段转写的工作线程与主线程同时首次触发加载（如中断后立刻再录），
+    用锁保证模型只加载一次；加载失败不留半成品实例，下次再试。
+    不直接打印加载提示（工作线程里打印会与主线程重绘抢屏），进度由调用方显示。
+    """
 
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                inst = super().__new__(cls)
+                inst._load()
+                cls._instance = inst
+            return cls._instance
 
-    def __init__(self):
-        if self._initialized:
-            return
-        print("🔄 正在加载 SenseVoice 模型…")
-        from funasr import AutoModel  # 延迟导入：约 5 秒，放在提示之后
+    def _load(self):
+        from funasr import AutoModel  # 延迟导入：约 5 秒
 
         self.model = AutoModel(
             model=SENSEVOICE_MODEL,
@@ -33,8 +38,6 @@ class SenseVoiceTranscriber:
             device=SENSEVOICE_DEVICE,
             disable_update=True,  # 跳过 funasr 联网检查更新，省一次网络往返
         )
-        self._initialized = True
-        print("✅ 模型加载完成\n")
 
     def transcribe(self, audio, language="auto"):
         """将音频数据转写为文本。

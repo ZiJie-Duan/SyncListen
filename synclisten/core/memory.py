@@ -170,7 +170,7 @@ class MemoryStore:
         self._ai_counter = 0
 
     # ── 后台更新 ──────────────────────────────────────
-    def update_async(self, current_doc, terms, ai_client, on_done=None, force=False):
+    def update_async(self, current_doc, ai_client, on_done=None, force=False):
         """在后台线程更新今天的记忆。
 
         force=True（[D] 删除等关键时刻）：排队等待当前更新结束后必定执行；
@@ -178,7 +178,7 @@ class MemoryStore:
         """
         t = threading.Thread(
             target=self._run_update,
-            args=(current_doc, terms, ai_client, on_done, force),
+            args=(current_doc, ai_client, on_done, force),
             daemon=True,
         )
         self._threads = [x for x in self._threads if x.is_alive()]
@@ -186,7 +186,7 @@ class MemoryStore:
         t.start()
         return t
 
-    def _run_update(self, current_doc, terms, ai_client, on_done, force):
+    def _run_update(self, current_doc, ai_client, on_done, force):
         if force:
             self._update_lock.acquire()
         elif not self._update_lock.acquire(blocking=False):
@@ -201,7 +201,6 @@ class MemoryStore:
                 recent_days=prev,
                 today_items=today,
                 current_doc=current_doc or "",
-                terms=list(terms or []),
                 char_limit=MEMORY_DAY_CHAR_LIMIT,
             )
             if not new_items:
